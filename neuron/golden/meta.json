@@ -1,0 +1,26 @@
+{
+  "short": {
+    "text": "Hello from Nari Labs.",
+    "speaker": "ryan",
+    "language": "english",
+    "frames": 22,
+    "code_shape": [
+      22,
+      16
+    ],
+    "audio_s": 1.76,
+    "cpu_s": 23.4
+  },
+  "medium": {
+    "text": "The quick brown fox jumps over the lazy dog, and then it runs back home before the rain starts.",
+    "speaker": "aiden",
+    "language": "english",
+    "frames": 74,
+    "code_shape": [
+      74,
+      16
+    ],
+    "audio_s": 5.92,
+    "cpu_s": 43.7
+  }
+}
