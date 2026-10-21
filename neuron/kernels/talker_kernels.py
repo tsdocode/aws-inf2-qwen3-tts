@@ -154,7 +154,7 @@ PAGE = 128           # tokens per KV page (block)
 MASK_NEG = -30000.0  # finite "minus infinity": gen2 PE transposes are not exact with inf (see NKI isa docs)
 
 
-def build_group_metadata(seqs, qps, pps, theta=None):
+def build_group_metadata(seqs, qps, pps, num_blocks):
     """Host-side schedule metadata for one attention group.
 
     seqs: list of (block_ids list, context_len_before_step, n_query_tokens) per segment; padded to the group's
@@ -163,6 +163,9 @@ def build_group_metadata(seqs, qps, pps, theta=None):
     Returns pages [1, nseg*pps] int32 block ids (pages are contiguous in HBM, gathered with one runtime
     ``scalar_offset`` each: 243 GB/s vs ~127 GB/s for per-partition ``vector_select`` on gen2) and the additive mask
     [128, nseg, pps, qps] fp32 (key k of page i at position i*128 + k is visible iff <= query position).
+    Padding pages get id ``num_blocks`` (just past the cache): the DMA skips them (oob_mode.skip). Must be the
+    *first* out-of-range id — a huge sentinel overflows the 32-bit element offset (id * 131072) and wraps
+    back in bounds, silently reading real cache memory.
     """
     nseg = len(seqs)
     offs = torch.zeros(1, nseg * pps, dtype=torch.int32)
@@ -170,7 +173,7 @@ def build_group_metadata(seqs, qps, pps, theta=None):
     lane = torch.arange(PAGE)
     for s, (blocks, ctx, nq) in enumerate(seqs):
         for i in range(pps):
-            offs[0, s * pps + i] = blocks[i] if i < len(blocks) else 0     # block 0 = reserved scratch page
+            offs[0, s * pps + i] = blocks[i] if i < len(blocks) else num_blocks
         for j in range(nq):
             qpos = ctx + j
             key_pos = torch.arange(pps).unsqueeze(0) * PAGE + lane.unsqueeze(1)          # [128, pps]
@@ -184,22 +187,36 @@ def _attend_group(q, att, tok0, nseg, qps, pps, offs_hbm, mask_hbm, k_pages, v_p
     NH, KVH = 16, 8
     lanes = 2 * qps                                            # 2 query heads per KV head x query tokens
     scale = 1.0 / (HEAD_DIM ** 0.5)
-    for c0 in nl.static_range(0, nseg, seg_chunk):
+    # Padding pages are skipped by the DMA (out-of-bounds id + oob_mode.skip), so their buffer slots keep old
+    # contents: two persistent buffers zeroed once (finite stale data is harmless under the -30000 mask), used
+    # ping-pong so chunk c+1's page DMAs can overlap chunk c's compute.
+    max_npg = min(seg_chunk, nseg) * pps
+    kbufs, vbufs = [], []
+    for _ in nl.static_range(2):
+        kb = nl.ndarray((P, max_npg, PAGE * KVH), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.memset(dst=kb, value=0.0)
+        vb = nl.ndarray((P, max_npg, KVH * HEAD_DIM), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.memset(dst=vb, value=0.0)
+        kbufs.append(kb)
+        vbufs.append(vb)
+    for ci, c0 in enumerate(nl.static_range(0, nseg, seg_chunk)):
         sc = min(seg_chunk, nseg - c0)
         npg = sc * pps
         offs = nl.ndarray((1, npg), dtype=nl.int32, buffer=nl.sbuf)
         nisa.dma_copy(dst=offs, src=offs_hbm[:, c0 * pps:c0 * pps + npg])
         mask = nl.ndarray((P, sc, pps, qps), dtype=nl.float32, buffer=nl.sbuf)
         nisa.dma_copy(dst=mask, src=mask_hbm[:, c0:c0 + sc, :, :])
-        kp = nl.ndarray((P, npg, PAGE * KVH), dtype=nl.bfloat16, buffer=nl.sbuf)   # [d, page, (key, g)]
-        vp = nl.ndarray((P, npg, KVH * HEAD_DIM), dtype=nl.bfloat16, buffer=nl.sbuf)  # [key, page, (g, d)]
+        kp = kbufs[ci % 2]                                     # [d, page, (key, g)]
+        vp = vbufs[ci % 2]                                     # [key, page, (g, d)]
         for i in nl.static_range(npg):
             nisa.dma_copy(dst=kp[:, i, :], src=k_pages.ap(pattern=[[PAGE * 8, P], [1, PAGE * 8]], offset=0,
-                                                          scalar_offset=offs[0:1, i:i + 1], indirect_dim=0))
+                                                          scalar_offset=offs[0:1, i:i + 1], indirect_dim=0),
+                          oob_mode=nisa.oob_mode.skip)
             nisa.dma_copy(dst=vp[:, i, :], src=v_pages.ap(pattern=[[8 * HEAD_DIM, P], [1, 8 * HEAD_DIM]], offset=0,
-                                                          scalar_offset=offs[0:1, i:i + 1], indirect_dim=0))
-        kp4 = kp.reshape((P, npg, PAGE, KVH))
-        vp4 = vp.reshape((P, npg, KVH, HEAD_DIM))
+                                                          scalar_offset=offs[0:1, i:i + 1], indirect_dim=0),
+                          oob_mode=nisa.oob_mode.skip)
+        kp4 = kp.reshape((P, max_npg, PAGE, KVH))
+        vp4 = vp.reshape((P, max_npg, KVH, HEAD_DIM))
         for g in nl.static_range(KVH):
             # QK^T: keys on partitions, (seg, page, head-pair, token) on the free axis
             sps = nl.ndarray((P, sc, pps, 2, qps), dtype=nl.float32, buffer=nl.psum)
@@ -232,24 +249,25 @@ def _attend_group(q, att, tok0, nseg, qps, pps, offs_hbm, mask_hbm, k_pages, v_p
             eb = nl.ndarray((P, sc, pps, 2, qps), dtype=nl.bfloat16, buffer=nl.sbuf)
             n_e = sc * pps * 2 * qps
             nisa.activation(dst=eb.reshape((P, n_e)), op=nl.exp, data=e.reshape((P, n_e)), scale=scale)
-            # denominators broadcast over d via ones-matmul, then PV accumulated over pages. Each accumulation
-            # gets its OWN PSUM tile: accumulate=True into a slice of a larger PSUM tile overwrote instead of
-            # accumulating on gen2 (only the last page survived).
-            den = nl.ndarray((P, sc, 2, qps), dtype=nl.float32, buffer=nl.sbuf)
+            # denominators: sum exp over pages on VectorE, then ONE ones-matmul per (chunk, head) sums over keys
+            # (partitions) and broadcasts over d. PV accumulates over pages. Each accumulation gets its OWN PSUM
+            # tile: accumulate=True into a slice of a larger PSUM tile overwrote instead of accumulating on gen2.
+            esum = nl.ndarray((P, sc, 2, qps), dtype=nl.bfloat16, buffer=nl.sbuf)
+            for hh in nl.static_range(2):
+                nisa.tensor_reduce(dst=esum[:, :, hh, :], op=nl.add, data=eb[:, :, :, hh, :].permute((0, 1, 3, 2)), axis=3)
+            dps = nl.ndarray((P, sc * lanes), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(dst=dps, stationary=ones_bf, moving=esum.reshape((P, sc * lanes)))
+            rden = nl.ndarray((P, sc, 2, qps), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.reciprocal(dst=rden.reshape((P, sc * lanes)), data=dps)    # VectorE: keeps ScalarE's table on exp
             num = nl.ndarray((P, sc, 2, qps), dtype=nl.float32, buffer=nl.sbuf)
             for s in nl.static_range(sc):
-                dps = nl.ndarray((P, 2, qps), dtype=nl.float32, buffer=nl.psum)
-                for i in nl.static_range(pps):
-                    nisa.nc_matmul(dst=dps, stationary=ones_bf, moving=eb[:, s, i, :, :], accumulate=(i > 0))
-                nisa.tensor_copy(dst=den[:, s, :, :], src=dps)
                 nps = nl.ndarray((P, 2, qps), dtype=nl.float32, buffer=nl.psum)
                 for i in nl.static_range(pps):
                     nisa.nc_matmul(dst=nps, stationary=vp4[:, s * pps + i, g, :], moving=eb[:, s, i, :, :], accumulate=(i > 0))
                 nisa.tensor_copy(dst=num[:, s, :, :], src=nps)
-            rden = nl.ndarray((P, sc, 2, qps), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.activation(dst=rden, op=nl.reciprocal, data=den)
+            den = dps
             if dbg is not None and c0 == 0 and g == 0:   # test-only: dump intermediates of the first (chunk, head)
-                for name, t in (("x", x), ("mb", mb), ("den", den), ("num", num), ("m1", m1), ("e", e), ("eb", eb)):
+                for name, t in (("x", x), ("mb", mb), ("den", den.reshape((P, sc, 2, qps))), ("num", num), ("m1", m1), ("e", e), ("eb", eb)):
                     tmp = nl.ndarray(t.shape, dtype=nl.float32, buffer=nl.sbuf)
                     nisa.tensor_copy(dst=tmp, src=t)
                     nisa.dma_copy(dst=dbg[name], src=tmp)
@@ -260,7 +278,7 @@ def _attend_group(q, att, tok0, nseg, qps, pps, offs_hbm, mask_hbm, k_pages, v_p
 
 
 @nki.jit
-def paged_attention(q_hbm, k_cache, v_cache, offs0, mask0, offs1=None, mask1=None, groups=(), seg_chunk: int = 8,
+def paged_attention(q_hbm, k_cache, v_cache, offs0, mask0, offs1=None, mask1=None, groups=(), seg_chunk: int = 4,
                     debug: bool = False):
     """One layer of mixed decode/prefill paged attention (standalone, for testing).
 

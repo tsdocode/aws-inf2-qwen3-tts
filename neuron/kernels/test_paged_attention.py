@@ -43,7 +43,7 @@ def main():
         groups.append((1, a.prefill, a.pps))
         segs.append(pre)
     for (nseg, qps, pps), seqs in zip(groups, segs):
-        o, m = build_group_metadata(seqs, qps, pps)
+        o, m = build_group_metadata(seqs, qps, pps, nblk)
         offs.append(o); masks.append(m)
     T = sum(n * q for n, q, _ in groups)
     q = torch.randn(D, NH, T).to(torch.bfloat16)
@@ -89,7 +89,8 @@ def main():
     us = (time.perf_counter() - t0) / a.iters * 1e6
     pages = sum(n * p for n, _, p in groups)
     kv_bytes = pages * PAGE * KVH * D * 2 * 2
-    print(f"{us:.0f} us per layer (wall, incl ~140 us launch); KV read {kv_bytes / 1e6:.1f} MB -> "
+    real = sum(len(b) for seqs in segs for b, _, _ in seqs) * PAGE * KVH * D * 2 * 2
+    print(f"{us:.0f} us per layer (wall, incl ~140 us launch); KV pages padded {kv_bytes / 1e6:.1f} MB, real {real / 1e6:.1f} MB -> "
           f"x28 layers = {us * 28 / 1e3:.1f} ms per step if standalone")
 
 
