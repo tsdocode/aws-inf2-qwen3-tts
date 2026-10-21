@@ -171,6 +171,15 @@ bias (use VectorE tensor_scalar for per-channel bias); GpSimd rejects fp32 tenso
 but does casts fine; `torch.neuron.synchronize()` for timing (D2H of block outputs is hundreds of MB).
 TODO: streaming mode — feed conv histories / transconv overlap as kernel inputs instead of zeros.
 
+### FP8 weight-only decode linear (`kernels/decode_linear.py: rmsnorm_linear_fp8_t`)
+- v2 TensorE accepts fp8 stationary x bf16 moving (fp32 PSUM). Only *legacy* float8_e4m3 (IEEE-style,
+  max 240) on v2; torch lacks it → encode with `ml_dtypes.float8_e4m3`, ship as uint8, `.view()` in
+  kernel. Verified on device: kernel vs host math on dequantized W = 2.4e-3 rel L2.
+- Per-output-channel quantization error: 2.6% rel L2 per matrix (end-to-end audio check TODO).
+- Talker MLP-shaped 2048x6144, B=32: **bf16 147.0 µs (172 GB/s) → fp8 104.6 µs** (12.75 MB). Only
+  1.4x: ~11 µs norm prologue before the weight stream + tail. A fused layer kernel keeps the weight
+  stream continuous across ops, which should get closer to 2x.
+
 ### Running total per frame-batch (B=32 per core)
 talker 29.6 (compiled) + CP 32.1 (compiled) + codec 9.4 (NKI) = **71.1 ms vs 80 ms budget**.
 
