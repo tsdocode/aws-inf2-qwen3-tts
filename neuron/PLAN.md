@@ -213,6 +213,19 @@ One NKI kernel per depth step: 5 layers + final norm + lm_head, KV slot written 
   prefill+decode is nearly free on the dense side; only attention scales with tokens x context.
 - Target with paged attention: ~11.7 + KV read (1.9 GB @ ctx 512 ≈ 7.3 ms) ≈ 19 ms vs 29.6 compiled.
 
+### Paged KV on gen2 (`kernels/test_paged_io.py`) — idioms verified bit-exact on inf2
+- K cache D-major `[blocks, D, BL, KVH]`, V cache token-major `[blocks, BL, KVH, D]` (BL=128): each page
+  gather is one `vector_select` DMA with 2 KiB contiguous per partition, landing directly in the
+  stationary layouts for QK^T (K: [D, keys]) and PV (V: [keys, D]).
+- Writes at runtime (block, offset): `.ap(..., scalar_offset=idx, indirect_dim=0)` per token; V is
+  transposed to token-major on TensorE first.
+- NKI-Lib attention kernels are NOT usable on gen2 as-is (indirect dma_transpose TRN2+, tensor
+  indirection v4+, hwdge v3+, range_select v3+). Design follows attention_tkg's orientation (K stationary,
+  Q moving; V stationary, P moving → no P transpose) with gen2-safe pieces. Score bound for a constant
+  softmax max is 187–5600 → real max pass needed (batched: free-axis reduce + one PE transpose).
+- Mixed batch plan: write all new K/V into the cache first, then attend from the cache only with one
+  predicate `key_pos <= q_pos` (covers decode, causal prefill chunks and padding).
+
 ### Running total per frame-batch (B=32 per core)
 talker 29.6 (compiled) + CP 32.1 (compiled) + codec 9.4 (NKI) = 71.1 ms →
 talker 29.6 (compiled) + **CP 12.6 (NKI)** + codec 9.4 (NKI) = **51.6 ms vs 80 ms budget**.
