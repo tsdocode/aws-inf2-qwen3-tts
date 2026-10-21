@@ -147,3 +147,158 @@ def talker_dense_step(xT, cos_hbm, sin_hbm, ln1, qkv, qn_w, kn_w, q_rot, k_rot, 
     hidden = nl.ndarray((H, T), dtype=nl.bfloat16, buffer=nl.shared_hbm)
     nisa.dma_copy(dst=hidden.reshape((KT, P, T)).permute((1, 0, 2)), src=xf)
     return hidden
+
+
+# ================================================================================ mixed paged attention
+PAGE = 128           # tokens per KV page (block)
+MASK_NEG = -30000.0  # finite "minus infinity": gen2 PE transposes are not exact with inf (see NKI isa docs)
+
+
+def build_group_metadata(seqs, qps, pps, theta=None):
+    """Host-side schedule metadata for one attention group.
+
+    seqs: list of (block_ids list, context_len_before_step, n_query_tokens) per segment; padded to the group's
+    static (len(seqs) segments, qps queries, pps pages). Query token j of a segment sits at position
+    context_len_before_step + j, and its own K/V has already been written to the cache.
+    Returns pages [1, nseg*pps] int32 block ids (pages are contiguous in HBM, gathered with one runtime
+    ``scalar_offset`` each: 243 GB/s vs ~127 GB/s for per-partition ``vector_select`` on gen2) and the additive mask
+    [128, nseg, pps, qps] fp32 (key k of page i at position i*128 + k is visible iff <= query position).
+    """
+    nseg = len(seqs)
+    offs = torch.zeros(1, nseg * pps, dtype=torch.int32)
+    mask = torch.full((PAGE, nseg, pps, qps), MASK_NEG)
+    lane = torch.arange(PAGE)
+    for s, (blocks, ctx, nq) in enumerate(seqs):
+        for i in range(pps):
+            offs[0, s * pps + i] = blocks[i] if i < len(blocks) else 0     # block 0 = reserved scratch page
+        for j in range(nq):
+            qpos = ctx + j
+            key_pos = torch.arange(pps).unsqueeze(0) * PAGE + lane.unsqueeze(1)          # [128, pps]
+            mask[:, s, :, j] = torch.where(key_pos <= qpos, 0.0, MASK_NEG)
+    return offs, mask
+
+
+def _attend_group(q, att, tok0, nseg, qps, pps, offs_hbm, mask_hbm, k_pages, v_pages, ones_bf, ident_f32, seg_chunk,
+                  dbg=None):
+    """Paged attention for one static group, writes att[:, h, tok0 + s*qps + j] (bf16, [D, NH, T] layout)."""
+    NH, KVH = 16, 8
+    lanes = 2 * qps                                            # 2 query heads per KV head x query tokens
+    scale = 1.0 / (HEAD_DIM ** 0.5)
+    for c0 in nl.static_range(0, nseg, seg_chunk):
+        sc = min(seg_chunk, nseg - c0)
+        npg = sc * pps
+        offs = nl.ndarray((1, npg), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=offs, src=offs_hbm[:, c0 * pps:c0 * pps + npg])
+        mask = nl.ndarray((P, sc, pps, qps), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=mask, src=mask_hbm[:, c0:c0 + sc, :, :])
+        kp = nl.ndarray((P, npg, PAGE * KVH), dtype=nl.bfloat16, buffer=nl.sbuf)   # [d, page, (key, g)]
+        vp = nl.ndarray((P, npg, KVH * HEAD_DIM), dtype=nl.bfloat16, buffer=nl.sbuf)  # [key, page, (g, d)]
+        for i in nl.static_range(npg):
+            nisa.dma_copy(dst=kp[:, i, :], src=k_pages.ap(pattern=[[PAGE * 8, P], [1, PAGE * 8]], offset=0,
+                                                          scalar_offset=offs[0:1, i:i + 1], indirect_dim=0))
+            nisa.dma_copy(dst=vp[:, i, :], src=v_pages.ap(pattern=[[8 * HEAD_DIM, P], [1, 8 * HEAD_DIM]], offset=0,
+                                                          scalar_offset=offs[0:1, i:i + 1], indirect_dim=0))
+        kp4 = kp.reshape((P, npg, PAGE, KVH))
+        vp4 = vp.reshape((P, npg, KVH, HEAD_DIM))
+        for g in nl.static_range(KVH):
+            # QK^T: keys on partitions, (seg, page, head-pair, token) on the free axis
+            sps = nl.ndarray((P, sc, pps, 2, qps), dtype=nl.float32, buffer=nl.psum)
+            for s in nl.static_range(sc):
+                t0 = tok0 + (c0 + s) * qps
+                qv = q[:, 2 * g:2 * g + 2, t0:t0 + qps]                                # [d, 2, qps]
+                for i in nl.static_range(pps):
+                    nisa.nc_matmul(dst=sps[:, s, i, :, :], stationary=kp4[:, s * pps + i, :, g], moving=qv)
+            x = nl.ndarray((P, sc, pps, 2, qps), dtype=nl.float32, buffer=nl.sbuf)
+            for hh in nl.static_range(2):
+                nisa.tensor_tensor(dst=x[:, :, :, hh, :], data1=sps[:, :, :, hh, :], data2=mask, op=nl.add)
+            # max over keys: free-axis reduce over pages, then one PE transpose for the partition axis
+            m1 = nl.ndarray((P, sc, 2, qps), dtype=nl.float32, buffer=nl.sbuf)
+            for hh in nl.static_range(2):  # vector ops take <= 3 free dims
+                nisa.tensor_reduce(dst=m1[:, :, hh, :], op=nl.maximum, data=x[:, :, :, hh, :].permute((0, 1, 3, 2)), axis=3)
+            L = sc * lanes
+            mt = nl.ndarray((L, P), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(dst=mt, stationary=m1.reshape((P, L)), moving=ident_f32)
+            mrow = nl.ndarray((L, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_reduce(dst=mrow, op=nl.maximum, data=mt, axis=1)
+            mbt = nl.ndarray((L, P), dtype=nl.float32, buffer=nl.sbuf)               # each lane's max, x128
+            nisa.tensor_scalar(dst=mbt, data=ident_f32[0:L, :], op0=nl.multiply, operand0=0.0, op1=nl.add, operand1=mrow)
+            mb = nl.ndarray((P, L), dtype=nl.float32, buffer=nl.psum)                # back: [keys, lanes]
+            nisa.nc_matmul(dst=mb, stationary=mbt, moving=ident_f32[0:L, 0:L])
+            e = nl.ndarray((P, sc, pps, 2, qps), dtype=nl.float32, buffer=nl.sbuf)
+            mb4 = mb.reshape((P, sc, 2, qps))
+            for hh in nl.static_range(2):
+                nisa.tensor_tensor(dst=e[:, :, :, hh, :], data1=x[:, :, :, hh, :],
+                                   data2=mb4[:, :, hh, :].expand_dim(2).broadcast(2, pps), op=nl.subtract)
+            eb = nl.ndarray((P, sc, pps, 2, qps), dtype=nl.bfloat16, buffer=nl.sbuf)
+            n_e = sc * pps * 2 * qps
+            nisa.activation(dst=eb.reshape((P, n_e)), op=nl.exp, data=e.reshape((P, n_e)), scale=scale)
+            # denominators broadcast over d via ones-matmul, then PV accumulated over pages. Each accumulation
+            # gets its OWN PSUM tile: accumulate=True into a slice of a larger PSUM tile overwrote instead of
+            # accumulating on gen2 (only the last page survived).
+            den = nl.ndarray((P, sc, 2, qps), dtype=nl.float32, buffer=nl.sbuf)
+            num = nl.ndarray((P, sc, 2, qps), dtype=nl.float32, buffer=nl.sbuf)
+            for s in nl.static_range(sc):
+                dps = nl.ndarray((P, 2, qps), dtype=nl.float32, buffer=nl.psum)
+                for i in nl.static_range(pps):
+                    nisa.nc_matmul(dst=dps, stationary=ones_bf, moving=eb[:, s, i, :, :], accumulate=(i > 0))
+                nisa.tensor_copy(dst=den[:, s, :, :], src=dps)
+                nps = nl.ndarray((P, 2, qps), dtype=nl.float32, buffer=nl.psum)
+                for i in nl.static_range(pps):
+                    nisa.nc_matmul(dst=nps, stationary=vp4[:, s * pps + i, g, :], moving=eb[:, s, i, :, :], accumulate=(i > 0))
+                nisa.tensor_copy(dst=num[:, s, :, :], src=nps)
+            rden = nl.ndarray((P, sc, 2, qps), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.activation(dst=rden, op=nl.reciprocal, data=den)
+            if dbg is not None and c0 == 0 and g == 0:   # test-only: dump intermediates of the first (chunk, head)
+                for name, t in (("x", x), ("mb", mb), ("den", den), ("num", num), ("m1", m1), ("e", e), ("eb", eb)):
+                    tmp = nl.ndarray(t.shape, dtype=nl.float32, buffer=nl.sbuf)
+                    nisa.tensor_copy(dst=tmp, src=t)
+                    nisa.dma_copy(dst=dbg[name], src=tmp)
+            for s in nl.static_range(sc):
+                t0 = tok0 + (c0 + s) * qps
+                nisa.tensor_tensor(dst=att[:, 2 * g:2 * g + 2, t0:t0 + qps], data1=num[:, s, :, :], data2=rden[:, s, :, :],
+                                   op=nl.multiply)
+
+
+@nki.jit
+def paged_attention(q_hbm, k_cache, v_cache, offs0, mask0, offs1=None, mask1=None, groups=(), seg_chunk: int = 8,
+                    debug: bool = False):
+    """One layer of mixed decode/prefill paged attention (standalone, for testing).
+
+    q_hbm [D, NH, T] bf16 (RoPE'd, normed); caches: K [NBLK, D, PAGE, KVH], V [NBLK, PAGE, KVH, D] (new tokens
+    already written). groups: static tuple of (nseg, qps, pps) (<= 2: decode, prefill) with tokens laid out group by
+    group, segment by segment; offs<i>/mask<i> from ``build_group_metadata`` (tensors must be separate args: a list
+    of tensors would become a static, value-keyed argument).
+    Returns att [D, NH, T] bf16.
+    """
+    D, NH, T = q_hbm.shape
+    NBLK = k_cache.shape[0]
+    q = nl.ndarray((D, NH, T), dtype=q_hbm.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=q, src=q_hbm)
+    att = nl.ndarray((D, NH, T), dtype=nl.bfloat16, buffer=nl.sbuf)
+    ones_bf = nl.ndarray((P, P), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.memset(dst=ones_bf, value=1.0)
+    ident_f32 = nl.shared_identity_matrix(n=P, dtype=nl.float32)
+    k_pages = k_cache.reshape((NBLK, HEAD_DIM * PAGE * 8))   # one row per block: scalar_offset = block id
+    v_pages = v_cache.reshape((NBLK, PAGE * 8 * HEAD_DIM))
+    tok0 = 0
+    meta = ((offs0, mask0), (offs1, mask1))
+    dbg = None
+    if debug:
+        n0, q0, p0 = groups[0]
+        sc0 = min(seg_chunk, n0)
+        dbg = {"x": nl.ndarray((P, sc0, p0, 2, q0), dtype=nl.float32, buffer=nl.shared_hbm),
+               "mb": nl.ndarray((P, sc0 * 2 * q0), dtype=nl.float32, buffer=nl.shared_hbm),
+               "den": nl.ndarray((P, sc0, 2, q0), dtype=nl.float32, buffer=nl.shared_hbm),
+               "num": nl.ndarray((P, sc0, 2, q0), dtype=nl.float32, buffer=nl.shared_hbm),
+               "m1": nl.ndarray((P, sc0, 2, q0), dtype=nl.float32, buffer=nl.shared_hbm),
+               "e": nl.ndarray((P, sc0, p0, 2, q0), dtype=nl.float32, buffer=nl.shared_hbm),
+               "eb": nl.ndarray((P, sc0, p0, 2, q0), dtype=nl.float32, buffer=nl.shared_hbm)}
+    for gi, (nseg, qps, pps) in enumerate(groups):
+        _attend_group(q, att, tok0, nseg, qps, pps, meta[gi][0], meta[gi][1], k_pages, v_pages, ones_bf, ident_f32,
+                      seg_chunk, dbg if gi == 0 else None)
+        tok0 += nseg * qps
+    out = nl.ndarray((D, NH, T), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+    nisa.dma_copy(dst=out, src=att)
+    if debug:
+        return out, dbg["x"], dbg["mb"], dbg["den"], dbg["num"], dbg["m1"], dbg["e"], dbg["eb"]
+    return out

@@ -226,6 +226,24 @@ One NKI kernel per depth step: 5 layers + final norm + lm_head, KV slot written 
 - Mixed batch plan: write all new K/V into the cache first, then attend from the cache only with one
   predicate `key_pos <= q_pos` (covers decode, causal prefill chunks and padding).
 
+### Mixed decode + prefill paged attention (`kernels/talker_kernels.py: paged_attention`) — CORRECT
+- Static groups (nseg, q tokens/seg, pages/seg): decode (32 x 1 x 4) + prefill (1 x 64 x 4) in ONE call;
+  host builds page ids + an additive mask (`key_pos <= q_pos`) once per step, shared by all 28 layers.
+- K page stationary / q moving → scores [keys, lanes]; batched max (free reduce + 1 PE transpose +
+  broadcast back); exp; ones-matmul denominators; V page stationary / exp moving → O^T [d, lanes].
+- vs dense torch: 2.05e-3 rel L2 (worst token 2.4e-3) incl. partial pages + causal prefill chunk.
+- Speed (69.8 MB KV read per layer, ctx padded to 512): vector_select gathers 704 µs → scalar_offset
+  per contiguous page **419 µs** (167 GB/s). Page-gather microbench: scalar_offset 243 GB/s vs static
+  259 GB/s.
+- gen2 gotchas found: (1) `accumulate=True` into a *slice* of a larger PSUM tile overwrote instead of
+  accumulating — give each accumulation its own PSUM tile; (2) vector ops take ≤ 3 free dims; (3)
+  NKI_ENABLE_TRACE_CACHE=1 (default here) can serve stale kernels after editing helper functions — use
+  NKI_ENABLE_TRACE_CACHE=0 while developing; (4) list-of-tensor kwargs become static, value-keyed args.
+- TODO: skip DMA for padding pages (~half the bytes here), prefetch next segment chunk, fuse into the
+  28-layer talker step with in-kernel KV writes.
+- Estimated fused talker step (B=32 + 64 prefill tokens): bytes 2.82 GB weights + 1.96 GB KV (ctx 512)
+  @ ~243 GB/s ≈ 19.7 ms; realistic ctx ~200 ≈ 15 ms (vs 29.6 ms compiled, decode only).
+
 ### Running total per frame-batch (B=32 per core)
 talker 29.6 (compiled) + CP 32.1 (compiled) + codec 9.4 (NKI) = 71.1 ms →
 talker 29.6 (compiled) + **CP 12.6 (NKI)** + codec 9.4 (NKI) = **51.6 ms vs 80 ms budget**.
