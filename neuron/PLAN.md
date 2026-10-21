@@ -67,8 +67,30 @@ Rules learned:
 - fp32 (repo default): 449.5 ms / chunk = **37.5 ms per frame-batch**, SNR 111.7 dB vs CPU fp32,
   compile 876 s. fp32 TensorE is ~4x slower than bf16 → bf16 run pending.
 
+- bf16: 29.2 ms per frame-batch (only 22% faster) and **SNR 24.9 dB** (worst row 28% rel err) →
+  plain bf16 unacceptable. Profile (`profiles/codec-bf16-b32`): 293 ms device / 12-frame chunk,
+  **9.8 GB HBM read + 4.4 GB written**, TensorE 16%; ScalarE 250k ACTIVATE (96 ms), GpSimd 117 ms,
+  VectorE casts/elementwise ~130 ms. Cause: SnakeBeta `x + 1/b*sin^2(a*x)` after every conv at audio
+  rate, each op a separate pass spilled to HBM; bf16 sin() also explains the quality loss.
+  Compute floor ≈ 2–3 GFLOP/frame/row → ~1–4 ms per frame-batch: **largest headroom of any stage**.
+
 ### Baseline per frame-batch (B=32 per core, compiler codegen, no NKI)
 Talker 29.6 + CP 32.1 + codec 37.5 (fp32) = **99.2 ms vs 80 ms real-time budget** → kernels required.
+
+### Measured DMA ceiling (`kernels/dma_ceiling.py`) — revises every bandwidth floor above
+Pure HBM→SBUF stream on one inf2 NeuronCore: **~175–180 GB/s end-to-end** (~220 GB/s while active),
+independent of 4–64 KiB/partition payloads. Not 410 (chip HBM/2) nor 272 (doc DMA peak).
+Revised floors @ ~200 GB/s, B=32/core: talker 17–23 ms (weights 2.8 GB + KV), CP 15.5 ms, codec
+compute-bound ~1–4 ms if fused. → bytes must drop, not just kernels improve:
+1. FP8 weights (TensorE supports fp8 on v2; H100 path already uses fp8 talker gate/up): ~-8 ms talker,
+   ~-7 ms CP. Needs audio-quality check.
+2. Fewer weight reads per stream: TP=2 across cores (halves weight bytes/stream, +~160 all-reduces per
+   frame) or stage split (core0 talker+CP for all 64 streams, core1 codec).
+3. Realistic context lengths from the benchmark (ctx 512 is pessimistic for KV).
+
+### First NKI kernel (`kernels/decode_linear.py`: fused RMSNorm + linear, transposed layout)
+- Correct first try (1.7e-4 rel L2), NKI compile 3 s. Device 70 µs for 8.46 MB (qkv 1024x4096,
+  B=32) vs 47 µs pure stream: weight DMA starts only after the norm preamble (11 µs) then ~157 GB/s.
 
 ### CP step profile deep-dive
 - ~5,100 tiny TensorE transposes (16x16 / x2) per step from attention reshapes (GQA
@@ -124,6 +146,12 @@ mirroring executor/build.py, host-copy PCM pool.
 - Two engine replicas pinned to NC0 / NC1 (`NEURON_RT_VISIBLE_CORES`), shared HTTP front.
 - Host CPU: only 4 vCPU — profile the Python planner/staging; move per-step metadata building
   (KV page tables, pinned allocs) to preallocated buffers.
+
+### Revised priority (2026-10-21, after baselines)
+1. **Codec fused conv + SnakeBeta kernel** (bf16 matmul / fp32 snake): 29–37 ms → target < 8 ms.
+2. **FP8 decode linear** (talker + CP): measure fp8 TensorE speed + quality on inf2.
+3. Placement: TP=2 vs stage split vs DP — measure inf2 all-reduce latency first.
+4. CP fused step kernel (attention ≤16, in-kernel KV write, no transposes); talker paged attention.
 
 ### 3. NKI kernels where the profile says so (days 3–6)
 Candidates, in expected order of payoff:
