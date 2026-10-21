@@ -24,7 +24,7 @@ def main():
     max_ctx = a.pps * PAGE
     nblk = 1 + (a.decode + 1) * a.pps
     perm = (torch.randperm(nblk - 1) + 1).tolist()                       # block 0 = scratch
-    k_cache = (torch.randn(nblk, D, PAGE, KVH) * 0.5).to(torch.bfloat16)
+    k_cache = (torch.randn(nblk, PAGE, KVH, D) * 0.5).to(torch.bfloat16)
     v_cache = torch.randn(nblk, PAGE, KVH, D).to(torch.bfloat16)
     k_cache[0] = 0; v_cache[0] = 0
 
@@ -53,7 +53,7 @@ def main():
     tok = 0
     for (nseg, qps, pps), seqs in zip(groups, segs):
         for blocks, ctx, nq in seqs:
-            K = torch.cat([k_cache[b].permute(1, 2, 0) for b in blocks]).float()   # [keys, KVH, D]
+            K = torch.cat([k_cache[b] for b in blocks]).float()                    # [keys, KVH, D]
             V = torch.cat([v_cache[b] for b in blocks]).float()                    # [keys, KVH, D]
             for j in range(nq):
                 n = ctx + j + 1

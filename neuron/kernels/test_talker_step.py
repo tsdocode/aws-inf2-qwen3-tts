@@ -87,13 +87,13 @@ def main():
             blocks.append([perm.pop() for _ in range(pps)])
     print(f"built CPU KV history for contexts {all_ctx} in {time.perf_counter() - t0:.0f}s", flush=True)
 
-    k_cache = torch.zeros(L, nblk, 128, PAGE, 8, dtype=torch.bfloat16)
+    k_cache = torch.zeros(L, nblk, PAGE, 8, 128, dtype=torch.bfloat16)
     v_cache = torch.zeros(L, nblk, PAGE, 8, 128, dtype=torch.bfloat16)
     for hist, blk in zip(hists, blocks):
         for l, (K, V) in enumerate(hist):
             for t in range(K.shape[0]):
                 b, o = blk[t // PAGE], t % PAGE
-                k_cache[l, b, :, o, :] = K[t].t()
+                k_cache[l, b, o] = K[t]
                 v_cache[l, b, o] = V[t]
 
     # this step's tokens: one decode token per sequence, then the prefill chunk
@@ -125,7 +125,7 @@ def main():
     gseqs = [[(blocks[i], c, 1) for i, c in enumerate(seqs)]] + ([[(blocks[-1], pre_ctx, a.prefill)]] if a.prefill else [])
     for (nseg, qps, p), sq in zip(groups, gseqs):
         metas += list(build_group_metadata(sq, qps, p, nblk))
-    kw, vw = kv_write_indices(wblk, woff, nblk)
+    rows = kv_write_indices(wblk, woff, nblk)
     cos, sin = rope_tables(positions, theta)
     prm = talker_params(talker)
     eps = prm.pop("eps")
@@ -133,7 +133,7 @@ def main():
     kcd, vcd = dev(k_cache), dev(v_cache)
     t0 = time.perf_counter()
     out = talker_step(dev(x.t()), dev(cos), dev(sin), **{k: dev(v) for k, v in prm.items()}, k_cache=kcd, v_cache=vcd,
-                      kw_hbm=dev(kw), vw_hbm=dev(vw), offs0=dev(metas[0]), mask0=dev(metas[1]),
+                      rows_hbm=dev(rows), offs0=dev(metas[0]), mask0=dev(metas[1]),
                       **({"offs1": dev(metas[2]), "mask1": dev(metas[3])} if a.prefill else {}),
                       groups=tuple(groups), eps=eps).cpu().float().t()
     print(f"talker_step groups {groups} T={x.shape[0]}: compile+run {time.perf_counter() - t0:.0f}s", flush=True)
@@ -151,7 +151,8 @@ def main():
                      f"CPU bf16 {(lr.argmax(-1) == l32.argmax(-1)).float().mean().item() * 100:.1f}%")
     print(line)
     # did the step's own K/V land in the cache?
-    nz = sum(int(kcd.cpu()[5, b, :, o, :].abs().sum() > 0) for b, o in zip(wblk, woff))
+    kcpu = kcd.cpu()
+    nz = sum(int(torch.allclose(kcpu[5, b, o].float(), kcpu[5, b, o].float()) and kcpu[5, b, o].abs().sum() > 0) for b, o in zip(wblk, woff))
     print(f"new-token K written into cache (layer 5): {nz}/{len(wblk)} slots non-zero")
 
 

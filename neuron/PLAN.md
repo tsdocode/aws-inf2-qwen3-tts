@@ -244,9 +244,24 @@ One NKI kernel per depth step: 5 layers + final norm + lm_head, KV slot written 
 - Estimated fused talker step (B=32 + 64 prefill tokens): bytes 2.82 GB weights + 1.96 GB KV (ctx 512)
   @ ~243 GB/s ≈ 19.7 ms; realistic ctx ~200 ≈ 15 ms (vs 29.6 ms compiled, decode only).
 
+### Fused Talker step (`kernels/talker_kernels.py: talker_step`) — CORRECT, 1.3x vs compiled
+28 layers in one launch, mixed decode + prefill-chunk tokens, paged KV written in-kernel.
+- Accuracy vs layer-wise fp32 oracle (real KV history, 4 decode + 32-token prefill): kernel 16.1% hidden
+  rel L2 / 75.0% argmax, CPU bf16 17.1% / 72.2% → bf16-level (this Talker drifts a lot in bf16 anyway).
+- KV write was the bottleneck (ablation: 70 ms step, write 49 ms): D-major K = 128 x 16 B dynamic
+  descriptors per token. Fix: K token-major like V → each layer's new K/V = ONE vector_offset scatter DMA
+  (tokens on partitions, OOB rows skipped); attention transposes K pages on TensorE (+~130 µs/layer).
+- Timings (B=32 decode): ctx 512 fixed **22.9 ms** (vs 29.6 compiled), mixed ctx (mean 223) 22.9 ms,
+  **+64 prefill tokens at ctx < 256: 20.2 ms** → prefill fused into decode steps is ~free.
+- Attention time barely depends on real context (padded pages still cost transposes/matmuls; per-segment
+  small-op overhead). Next: transpose only partial tail pages (keep full pages D-major), bigger
+  segment chunks, pps buckets chosen per step from the longest active context.
+- gen2 gotchas: GpSimd cannot read PSUM; ScalarE PSUM copies must use activation(op=copy).
+
 ### Running total per frame-batch (B=32 per core)
 talker 29.6 (compiled) + CP 32.1 (compiled) + codec 9.4 (NKI) = 71.1 ms →
-talker 29.6 (compiled) + **CP 12.6 (NKI)** + codec 9.4 (NKI) = **51.6 ms vs 80 ms budget**.
+talker 29.6 (compiled) + CP 12.6 (NKI) + codec 9.4 (NKI) = 51.6 ms →
+**talker 22.9 (NKI, ctx 512) + CP 12.6 + codec 9.4 = 44.9 ms vs 80 ms budget** (prefill chunks ride along ~free).
 
 ### Revised priority (2026-10-21, after baselines)
 1. ~~Codec fused conv + SnakeBeta kernel~~ done: 37.5 → 9.4 ms (fp32 front) / 8.4 ms (bf16 front).
