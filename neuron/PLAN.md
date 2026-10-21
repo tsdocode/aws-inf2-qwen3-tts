@@ -55,6 +55,21 @@ Rules learned:
 2. Select per-step weights by passing them as graph inputs, not `index_select` inside the graph.
 3. Load weights with sequential reads: mmap'd safetensors on this EBS volume ran at 4.6 MB/s.
 
+### Talker decode prototype (`proto/talker_decode.py`, B=32, dense KV ctx 512, read-only in graph)
+- 29.6 ms / step, compile 20 s. Bandwidth floor ≈ 10 ms.
+- Per-component numerics (`proto/numerics_probe.py`): rmsnorm/q_norm exact, linears ~1e-5,
+  rope 8e-5, masked attention 2.5e-3, MLP 4.5e-3 rel L2 — all bf16-level.
+- Per-layer drift (`proto/layer_drift.py`): with random KV, CPU bf16 vs fp32 drifts to 55% at
+  layer 27 and Neuron to 56% → synthetic inputs are ill-conditioned, not a Neuron bug.
+  Open item: Neuron error jumps 3× vs CPU at layer 2 — recheck with real prefill KV.
+
+### Baseline per frame-batch (B=32 per core, compiler codegen, no NKI)
+Talker 29.6 + CP 32.1 = 61.7 ms + codec (TBD) vs 80 ms real-time budget → kernels are required.
+
+4. Disable dynamo `automatic_dynamic_shapes` — a second batch bucket for the same module otherwise
+   recompiles with dynamic dims, which neuronx-cc cannot lower.
+5. Accuracy must be validated on real states (prefill KV from golden prompts), not random tensors.
+
 Accuracy note: greedy token agreement with random `past_hidden` is 82% on Neuron, but even CPU
 bf16 with reordered math is only 98.2% — near-tie logits on random inputs. Needs teacher-forced
 logit comparison on real talker hidden states (golden prompts) vs fp32.
