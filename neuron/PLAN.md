@@ -180,8 +180,25 @@ TODO: streaming mode — feed conv histories / transconv overlap as kernel input
   1.4x: ~11 µs norm prologue before the weight stream + tail. A fused layer kernel keeps the weight
   stream continuous across ops, which should get closer to 2x.
 
+### Fused Code Predictor step kernel (`kernels/cp_kernels.py: cp_step`) — DONE (bf16)
+One NKI kernel per depth step: 5 layers + final norm + lm_head, KV slot written in place by DMA.
+- q/k-norm weight + RoPE folded into one 128x128 matrix per (layer, step, q|k): 2 fp32 matmuls per
+  layer instead of rotate-half shuffles (the compiler's ~5.1k transposes).
+- Attention over s+1 slots: elementwise q*K, ones-matmul (sums over head dim + broadcasts), softmax
+  on the free axis, p*V reduced over slots → lands in o_proj's input layout. Specialized per s (16
+  kernels, ~4.5 s compile each).
+- Accuracy vs fp32 oracle (teacher-forced, 8 steps, B=32): kernel 0.9–1.9e-2 logits rel L2, CPU
+  bf16 1.0–2.1e-2 → as accurate as torch bf16.
+- **12.6 ms per frame-batch (B=32) vs 32.1 compiled** (2.5x). Step device time 848 µs at 203 GB/s,
+  DMA 83% → at the measured bandwidth ceiling.
+- FP8 (per-output-channel e4m3): 9.37 ms/frame but logits error 7–17% (all groups) / 3–8% (MLP only)
+  vs 1–2% bf16 → too lossy. Block scales via `scalar_tensor_tensor` partial-sum accumulation cost ~0.35 ms
+  /step at 128-wide blocks (≈ the fp8 saving). Kept as opt-in per group (`cp_step_params(fp8=[...])`);
+  revisit with audio-level evaluation or K=512 blocks.
+
 ### Running total per frame-batch (B=32 per core)
-talker 29.6 (compiled) + CP 32.1 (compiled) + codec 9.4 (NKI) = **71.1 ms vs 80 ms budget**.
+talker 29.6 (compiled) + CP 32.1 (compiled) + codec 9.4 (NKI) = 71.1 ms →
+talker 29.6 (compiled) + **CP 12.6 (NKI)** + codec 9.4 (NKI) = **51.6 ms vs 80 ms budget**.
 
 ### Revised priority (2026-10-21, after baselines)
 1. ~~Codec fused conv + SnakeBeta kernel~~ done: 37.5 → 9.4 ms (fp32 front) / 8.4 ms (bf16 front).
