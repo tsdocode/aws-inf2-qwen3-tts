@@ -68,11 +68,13 @@ def talker_params(talker, layers=None):
 def _qk_norm_rope(qk, nheads, T, w_hbm, rot_hbm, cos, sin, eps, ones_f32):
     """qk [P, nheads, T] bf16 (raw projections) -> RoPE(RMSNorm_head(x) * w) bf16 [P, nheads, T]."""
     n = nheads * T
+    hc = max(1, 512 // T)      # whole heads per <=512-wide matmul chunk (T need not divide 512)
+    assert T <= 512, T
     sq = nl.ndarray((P, n), dtype=nl.float32, buffer=nl.sbuf)
     nisa.activation(dst=sq, op=nl.square, data=qk.reshape((P, n)))
     inv = nl.ndarray((P, n), dtype=nl.float32, buffer=nl.sbuf)
-    for c in nl.static_range(0, n, 512):
-        w_ = min(512, n - c)
+    for h0 in nl.static_range(0, nheads, hc):
+        c, w_ = h0 * T, min(hc, nheads - h0) * T
         ss = nl.ndarray((P, w_), dtype=nl.float32, buffer=nl.psum)
         nisa.nc_matmul(dst=ss, stationary=ones_f32, moving=sq[:, c:c + w_])
         nisa.activation(dst=inv[:, c:c + w_], op=nl.rsqrt, data=ss, scale=1.0 / HEAD_DIM, bias=eps)
@@ -85,11 +87,11 @@ def _qk_norm_rope(qk, nheads, T, w_hbm, rot_hbm, cos, sin, eps, ones_f32):
     xw = nl.ndarray((P, nheads, T), dtype=nl.float32, buffer=nl.sbuf)       # w * x / rms
     nisa.tensor_scalar(dst=xw.reshape((P, n)), data=xn, op0=nl.multiply, operand0=w)
     out = nl.ndarray((P, nheads, T), dtype=nl.bfloat16, buffer=nl.sbuf)
-    for c in nl.static_range(0, n, 512):
-        w_ = min(512, n - c)
+    for h0 in nl.static_range(0, nheads, hc):
+        hn = min(hc, nheads - h0)
+        c, w_ = h0 * T, hn * T
         rot = nl.ndarray((P, w_), dtype=nl.float32, buffer=nl.psum)        # rotate_half(w * x / rms)
         nisa.nc_matmul(dst=rot, stationary=rot_m, moving=xn[:, c:c + w_])
-        h0, hn = c // T, w_ // T
         a = nl.ndarray((P, hn, T), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_tensor(dst=a, data1=xw[:, h0:h0 + hn, :], data2=cos.expand_dim(1).broadcast(1, hn), op=nl.multiply)
         b = nl.ndarray((P, hn, T), dtype=nl.float32, buffer=nl.sbuf)
@@ -320,3 +322,106 @@ def paged_attention(q_hbm, k_cache, v_cache, offs0, mask0, offs1=None, mask1=Non
     if debug:
         return out, dbg["x"], dbg["mb"], dbg["den"], dbg["num"], dbg["m1"], dbg["e"], dbg["eb"]
     return out
+
+
+# ======================================================================================= full talker step
+def kv_write_indices(blocks_per_token, offset_per_token, num_blocks):
+    """Host: per-token write rows for the K view [NBLK*D*PAGE, KVH] (row = (blk*D)*PAGE + off; + d*PAGE via the
+    access pattern) and the V view [NBLK*PAGE, KVH*D] (row = blk*PAGE + off). Padding tokens (block < 0) get
+    out-of-range rows so their writes are skipped."""
+    blk = torch.as_tensor(blocks_per_token).long()
+    off = torch.as_tensor(offset_per_token).long()
+    pad = blk < 0
+    kw = torch.where(pad, num_blocks * HEAD_DIM * PAGE, blk * HEAD_DIM * PAGE + off)
+    vw = torch.where(pad, num_blocks * PAGE, blk * PAGE + off)
+    return kw.int().reshape(1, -1).contiguous(), vw.int().reshape(1, -1).contiguous()
+
+
+def _write_kv(k, v, T, kw, vw, k_rows, v_rows, ident_bf):
+    """Write this step's T tokens of K ([D, KVH, T]) and V into the paged caches at their runtime rows."""
+    KVH = 8
+    for t0 in nl.static_range(0, T, P):
+        tn = min(P, T - t0)
+        vtok = nl.ndarray((tn, KVH, HEAD_DIM), dtype=nl.bfloat16, buffer=nl.sbuf)     # token-major for V
+        for h in nl.static_range(KVH):
+            tp = nl.ndarray((tn, HEAD_DIM), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(dst=tp, stationary=v[:, h, t0:t0 + tn], moving=ident_bf)
+            nisa.tensor_copy(dst=vtok[:, h, :], src=tp)
+        for j in nl.static_range(tn):
+            t = t0 + j
+            nisa.dma_copy(dst=k_rows.ap(pattern=[[PAGE * KVH, HEAD_DIM], [1, KVH]], offset=0, scalar_offset=kw[0:1, t:t + 1],
+                                        indirect_dim=0), src=k[:, :, t], oob_mode=nisa.oob_mode.skip)
+            nisa.dma_copy(dst=v_rows.ap(pattern=[[KVH * HEAD_DIM, 1], [1, KVH * HEAD_DIM]], offset=0,
+                                        scalar_offset=vw[0:1, t:t + 1], indirect_dim=0),
+                          src=vtok[j:j + 1, :, :].reshape((1, KVH * HEAD_DIM)), oob_mode=nisa.oob_mode.skip)
+
+
+@nki.jit
+def talker_step(xT, cos_hbm, sin_hbm, ln1, qkv, qn_w, kn_w, q_rot, k_rot, o, ln2, gate_up, down, final_norm,
+                k_cache, v_cache, kw_hbm, vw_hbm, offs0, mask0, offs1=None, mask1=None, groups=(), eps: float = 1e-6,
+                seg_chunk: int = 4):
+    """Full Talker step (28 layers) for a MIXED token batch with paged KV.
+
+    xT [2048, T] bf16 input embeddings (tokens ordered group by group, segment by segment); cos/sin [128, T];
+    k_cache [L, NBLK, D, PAGE, KVH] / v_cache [L, NBLK, PAGE, KVH, D] bf16, updated in place with this step's K/V
+    (rows from ``kv_write_indices``); groups + offs/mask from ``build_group_metadata``.
+    Returns the final-normed hidden [2048, T] bf16.
+    """
+    H, T = xT.shape
+    L = ln1.shape[0]
+    NBLK = k_cache.shape[1]
+    KT = H // P
+    NH, KVH = 16, 8
+    nqk = NH + KVH
+
+    ones_f32 = nl.ndarray((P, P), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.memset(dst=ones_f32, value=1.0)
+    ones_bf = nl.ndarray((P, P), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.memset(dst=ones_bf, value=1.0)
+    ident_f32 = nl.shared_identity_matrix(n=P, dtype=nl.float32)
+    ident_bf = nl.shared_identity_matrix(n=P, dtype=nl.bfloat16)
+    cos = nl.ndarray((P, T), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=cos, src=cos_hbm)
+    sin = nl.ndarray((P, T), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=sin, src=sin_hbm)
+    kw = nl.ndarray((1, T), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=kw, src=kw_hbm)
+    vw = nl.ndarray((1, T), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=vw, src=vw_hbm)
+    x = nl.ndarray((P, KT, T), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.dma_copy(dst=x, src=xT.reshape((KT, P, T)).permute((1, 0, 2)))
+    meta = ((offs0, mask0), (offs1, mask1))
+
+    for l in nl.static_range(L):
+        hn = _rmsnorm(x, ln1[l], KT, T, eps, ones_f32)
+        qkv_t = _linear(hn, KT, qkv[l], T, nl.bfloat16)                       # [P, 32, T]
+        q = _qk_norm_rope(qkv_t[:, 0:NH, :], NH, T, qn_w[l], q_rot[l], cos, sin, eps, ones_f32)
+        k = _qk_norm_rope(qkv_t[:, NH:nqk, :], KVH, T, kn_w[l], k_rot[l], cos, sin, eps, ones_f32)
+        v = qkv_t[:, nqk:nqk + KVH, :]
+        k_rows = k_cache[l].reshape((NBLK * HEAD_DIM * PAGE, KVH))
+        v_rows = v_cache[l].reshape((NBLK * PAGE, KVH * HEAD_DIM))
+        _write_kv(k, v, T, kw, vw, k_rows, v_rows, ident_bf)
+        att = nl.ndarray((P, NH, T), dtype=nl.bfloat16, buffer=nl.sbuf)
+        k_pages = k_cache[l].reshape((NBLK, HEAD_DIM * PAGE * KVH))
+        v_pages = v_cache[l].reshape((NBLK, PAGE * KVH * HEAD_DIM))
+        tok0 = 0
+        for gi, (nseg, qps, pps) in enumerate(groups):
+            _attend_group(q, att, tok0, nseg, qps, pps, meta[gi][0], meta[gi][1], k_pages, v_pages, ones_bf, ident_f32,
+                          seg_chunk)
+            tok0 += nseg * qps
+        attn_out = _linear(att, NH, o[l], T, nl.bfloat16)
+        x = _add_residual(x, attn_out, KT, T)
+        hn2 = _rmsnorm(x, ln2[l], KT, T, eps, ones_f32)
+        gu = _linear(hn2, KT, gate_up[l], T, nl.bfloat16)                     # [P, 96, T]
+        I_T = gu.shape[1] // 2
+        act = nl.ndarray((P, I_T, T), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.activation(dst=act, op=nl.silu, data=gu[:, 0:I_T, :])
+        hmid = nl.ndarray((P, I_T, T), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=hmid, data1=act, data2=gu[:, I_T:2 * I_T, :], op=nl.multiply)
+        mlp_out = _linear(hmid, I_T, down[l], T, nl.bfloat16)
+        x = _add_residual(x, mlp_out, KT, T)
+
+    xf = _rmsnorm(x, final_norm, KT, T, eps, ones_f32)
+    hidden = nl.ndarray((H, T), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+    nisa.dma_copy(dst=hidden.reshape((KT, P, T)).permute((1, 0, 2)), src=xf)
+    return hidden
