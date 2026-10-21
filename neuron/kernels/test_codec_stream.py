@@ -21,6 +21,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rows", type=int, default=2)
     ap.add_argument("--schedule", type=int, nargs="+", default=[1, 2, 4, 8, 12, 12, 12, 12])
+    ap.add_argument("--front-bf16", action="store_true")
     a = ap.parse_args()
     loader = CheckpointLoader(ModelAssetConfig(model_id=MODEL, device="cpu", require_h100=False, local_files_only=True))
     decoder = loader.load_codec(device=torch.device("cpu"), dtype=torch.float32).float().decoder.eval()
@@ -30,7 +31,7 @@ def main():
     rows = torch.stack([codes[r * 3:r * 3 + total] for r in range(a.rows)]).transpose(1, 2).contiguous()  # [B,16,F]
     with torch.no_grad():
         ref = decoder(rows).float()                                       # whole sequence, CPU fp32
-    neu = StreamingCodecDecoder(decoder, batch=a.rows)
+    neu = StreamingCodecDecoder(decoder, batch=a.rows, front_dtype=torch.bfloat16 if a.front_bf16 else torch.float32)
     chunks, f0 = [], 0
     t0 = time.perf_counter()
     for i, f in enumerate(a.schedule):

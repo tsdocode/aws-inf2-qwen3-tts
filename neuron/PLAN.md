@@ -258,6 +258,24 @@ One NKI kernel per depth step: 5 layers + final norm + lm_head, KV slot written 
   segment chunks, pps buckets chosen per step from the longest active context.
 - gen2 gotchas: GpSimd cannot read PSUM; ScalarE PSUM copies must use activation(op=copy).
 
+### Engine v1 (`neuron/engine/neuron_engine.py`) — end-to-end CORRECT on inf2
+- Lockstep continuous batching: per step one fused talker step (decode + <=1 prefill chunk), host talker
+  sampling, CP frame (16 NKI steps, on-device sampling graph), one streaming-codec frame for all slots.
+- Teacher-forced vs fp32 golden (both prompts concurrently): talker cb0 100%, CP 96–97%, EOS at the golden
+  frame. Free-running greedy diverges after a few frames — upstream qwen_tts in bf16 on CPU does too.
+- Bugs found: (1) codec kernels dropped the remainder when T % 512 != 0 (streaming F=1); (2) padding
+  OOB ids must be out of range for the WHOLE stacked cache — the bound is per allocation, not per view, so
+  row NBLK*PAGE of layer l is layer l+1's block 0 (it corrupted whichever stream owned block 0).
+- Streaming codec (stateful front + kernels with history): exact vs whole-sequence, 52.5 dB.
+- 32 slots / 32 concurrent requests, one core (profiled, device-synced): step median **91.5 ms**
+  (8.9x real time aggregate): talker 19.0, CP 18.8 (was 74 with host sampling), codec 48.7, host ~4.
+- Codec frame breakdown (B=32, F=1): NKI audio blocks ~15 ms, **compiled front ~28-33 ms fixed per call**
+  (independent of F; 3.7 GB HBM reads in ~371k small DMA packets: layout transposes / concat spills around
+  the 74 MB fp32 transformer KV state). Rewriting convs as row-batched matmuls and 2-D linears: no change;
+  bf16 front: no speedup and 42 dB.
+- Next: (a) call the codec every K steps (F=K) with a TTFA fast path for new streams, or (b) NKI kernel
+  for the front transformer (removes the ~30 ms fixed cost). Then 2 cores + HTTP + load test.
+
 ### Running total per frame-batch (B=32 per core)
 talker 29.6 (compiled) + CP 32.1 (compiled) + codec 9.4 (NKI) = 71.1 ms →
 talker 29.6 (compiled) + CP 12.6 (NKI) + codec 9.4 (NKI) = 51.6 ms →

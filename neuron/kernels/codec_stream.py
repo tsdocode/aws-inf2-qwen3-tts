@@ -27,11 +27,37 @@ def _rotate_half(x):
 
 
 def _causal_conv_step(module, x, hist):
-    """Stride-1 CausalConvNet on fresh positions with explicit left history -> (y, new_hist)."""
+    """Stride-1 CausalConvNet on fresh positions with explicit left history -> (y, new_hist).
+
+    Written as ONE matmul over all rows (im2col, M = B*T): the compiler lowers a batched Conv1d per batch row and
+    re-reads the weights for every row (front was 4 GB of HBM reads / 27 ms per call at B=32).
+    """
+    conv = module.conv
     pad = int(module.padding)
+    T = x.shape[-1]
     comb = torch.cat((hist, x), dim=-1) if pad else x
-    y = module.conv(comb)
+    k, dil = conv.kernel_size[0], conv.dilation[0]
+    if conv.groups == conv.in_channels and conv.groups > 1:                 # depthwise: sum of shifted products
+        w = conv.weight[:, 0, :]                                             # [C, k]
+        y = sum(comb[:, :, j * dil:j * dil + T] * w[:, j].view(1, -1, 1) for j in range(k))
+        y = y + conv.bias.view(1, -1, 1)
+    else:
+        cols = torch.stack([comb[:, :, j * dil:j * dil + T] for j in range(k)], dim=-1)   # [B, Cin, T, k]
+        B, Cin = cols.shape[:2]
+        cols = cols.permute(0, 2, 1, 3).reshape(B * T, Cin * k)
+        y = cols @ conv.weight.reshape(conv.out_channels, Cin * k).t() + conv.bias
+        y = y.reshape(B, T, -1).permute(0, 2, 1)
     return y, (comb[..., comb.shape[-1] - pad:] if pad else hist)
+
+
+def _transconv_kernel_eq_stride(module, x):
+    """CausalTransConvNet with kernel == stride (no overlap) as one matmul over all rows."""
+    conv = module.conv
+    B, Cin, T = x.shape
+    r = conv.stride[0]
+    y = x.permute(0, 2, 1).reshape(B * T, Cin) @ conv.weight.reshape(Cin, -1)          # [B*T, Cout*r]
+    y = y.reshape(B, T, conv.out_channels, r).permute(0, 2, 1, 3).reshape(B, conv.out_channels, T * r)
+    return y + conv.bias.view(1, -1, 1)
 
 
 class StreamingFront(nn.Module):
@@ -64,10 +90,12 @@ class StreamingFront(nn.Module):
         tf = d.pre_transformer
         hidden = d.quantizer.decode(codes)
         hidden, pre = _causal_conv_step(d.pre_conv, hidden, pre)
-        hidden = tf.input_proj(hidden.transpose(1, 2))
-        B, Fr = hidden.shape[:2]
+        B, Fr = hidden.shape[0], hidden.shape[2]
+        # All transformer linears run on 2-D [B*F, C] activations: with 3-D inputs the compiler emits a batched
+        # matmul that reloads the weights for every row (4 GB of HBM reads per call at B=32, F=1).
+        hidden = tf.input_proj(hidden.transpose(1, 2).reshape(B * Fr, -1))                    # [B*F, D]
         position_ids = pos.unsqueeze(1) + torch.arange(Fr, device=hidden.device).unsqueeze(0)
-        cos, sin = tf.rotary_emb(hidden, position_ids)
+        cos, sin = tf.rotary_emb(hidden.view(B, Fr, -1), position_ids)
         cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
         R = self.retained
         slots = torch.arange(R, device=hidden.device)
@@ -80,10 +108,10 @@ class StreamingFront(nn.Module):
         mask = (valid.unsqueeze(1) & (kp <= qp) & (kp > qp - self.window)).unsqueeze(1)
         new_k, new_v = [], []
         for li, layer in enumerate(tf.layers):
-            res = hidden
+            res = hidden                                                                       # [B*F, D]
             n = layer.input_layernorm(hidden)
             att = layer.self_attn
-            shp = (*n.shape[:-1], -1, att.head_dim)
+            shp = (B, Fr, -1, att.head_dim)
             q = att.q_norm(att.q_proj(n).view(shp)).transpose(1, 2)
             k = att.k_norm(att.k_proj(n).view(shp)).transpose(1, 2)
             v = att.v_proj(n).view(shp).transpose(1, 2)
@@ -97,19 +125,20 @@ class StreamingFront(nn.Module):
                 all_k = all_k.repeat_interleave(att.num_key_value_groups, 1)
                 all_v = all_v.repeat_interleave(att.num_key_value_groups, 1)
             o = F.scaled_dot_product_attention(q, all_k, all_v, attn_mask=mask, scale=att.scaling)
-            o = att.o_proj(o.transpose(1, 2).reshape(*n.shape[:-1], -1))
+            o = att.o_proj(o.transpose(1, 2).reshape(B * Fr, -1))
             hidden = res + layer.self_attn_layer_scale(o)
             res = hidden
             hidden = res + layer.mlp_layer_scale(layer.mlp(layer.post_attention_layernorm(hidden)))
-        hidden = tf.output_proj(tf.norm(hidden)).permute(0, 2, 1)
+        hidden = tf.output_proj(tf.norm(hidden)).view(B, Fr, -1).permute(0, 2, 1)
         cnx = [cnx0, cnx1]
         for i, blocks in enumerate(d.upsample):
-            hidden = blocks[0](hidden)                       # kernel == stride: no overlap state
+            hidden = _transconv_kernel_eq_stride(blocks[0], hidden)   # kernel == stride: no overlap state
             cn = blocks[1]
             r = hidden
             h, cnx[i] = _causal_conv_step(cn.dwconv, hidden, cnx[i])
-            h = cn.pwconv2(cn.act(cn.pwconv1(cn.norm(h.permute(0, 2, 1)))))
-            hidden = r + (cn.gamma * h).permute(0, 2, 1)
+            Tn = h.shape[-1]
+            h = cn.pwconv2(cn.act(cn.pwconv1(cn.norm(h.permute(0, 2, 1).reshape(B * Tn, -1)))))   # 2-D: one GEMM
+            hidden = r + (cn.gamma * h).view(B, Tn, -1).permute(0, 2, 1)
         hidden, dec0 = _causal_conv_step(d.decoder[0], hidden, dec0)
         return (hidden.contiguous(), pos + Fr, torch.clamp(ctx + Fr, max=R), pre, torch.stack(new_k), torch.stack(new_v),
                 cnx[0], cnx[1], dec0)
@@ -118,8 +147,9 @@ class StreamingFront(nn.Module):
 class StreamingCodecDecoder:
     """B streams decoded in lockstep, chunk by chunk; ``reset_rows`` starts new streams in given rows."""
 
-    def __init__(self, decoder, batch, device="neuron"):
+    def __init__(self, decoder, batch, device="neuron", front_dtype=torch.float32):
         decoder = decoder.float().eval()
+        self.front_dtype = front_dtype
         self.B, self.device = batch, device
         self.front_mod = StreamingFront(decoder)
         self.blocks = []
@@ -137,7 +167,16 @@ class StreamingCodecDecoder:
         self.tail_params = {k: v.to(device) for k, v in snake_conv_out_params(decoder.decoder[5], decoder.decoder[6]).items()}
         self.tail_c = decoder.decoder[6].conv.in_channels
         decoder.to(device)
-        self.front = torch.compile(self.front_mod, backend="neuron", fullgraph=True)
+        if front_dtype != torch.float32:
+            mod = self.front_mod
+
+            def run(*a):
+                with torch.autocast("neuron", dtype=front_dtype):
+                    out = mod(*a)
+                return tuple(o.float() if o.is_floating_point() else o for o in out)
+            self.front = torch.compile(run, backend="neuron", fullgraph=True)
+        else:
+            self.front = torch.compile(self.front_mod, backend="neuron", fullgraph=True)
         self.state = self._fresh_state()
 
     def _fresh_state(self):

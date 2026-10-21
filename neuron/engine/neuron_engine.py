@@ -74,6 +74,27 @@ class Stream:
     pred: list = field(default_factory=list)       # teacher forcing: model's own pick per frame [16]
 
 
+class _DeviceSampler(torch.nn.Module):
+    """On-device Code Predictor sampling + next-input lookup (one compiled graph, reused for all 15 steps).
+
+    top-k (static k) with per-row temperature, inverse-CDF draw with host-supplied uniforms (inf2 has no on-device
+    RNG), argmax for greedy rows; then the projected embedding of the chosen token for the next depth step.
+    """
+
+    def __init__(self, k):
+        super().__init__()
+        self.k = k
+
+    def forward(self, logitsT, u, inv_temp, greedy, table):
+        logits = logitsT.t().float()                                       # [S, V]
+        vals, idx = torch.topk(logits, self.k, dim=-1)
+        probs = torch.softmax(vals * inv_temp, dim=-1)
+        cdf = torch.cumsum(probs, dim=-1)
+        pick = (cdf < (u * cdf[:, -1]).unsqueeze(-1)).sum(-1).clamp(max=self.k - 1)
+        tok = torch.where(greedy, idx[:, 0], idx.gather(-1, pick.unsqueeze(-1)).squeeze(-1))
+        return tok, F.embedding(tok, table)
+
+
 def _sample(logits, temperature, top_k, top_p, greedy, gen):
     if greedy:
         return logits.argmax(-1)
@@ -90,13 +111,15 @@ def _sample(logits, temperature, top_k, top_p, greedy, gen):
 
 
 class NeuronTTSEngine:
-    def __init__(self, model_dir, slots=32, device="neuron", seed=0, log=print, mix_prefill=True):
+    def __init__(self, model_dir, slots=32, device="neuron", seed=0, log=print, mix_prefill=True, profile=False):
         from nari_qwen3_tts.config import ModelAssetConfig
         from nari_qwen3_tts.model.checkpoint import CheckpointLoader
         from transformers import Qwen2TokenizerFast
 
         self.log, self.device, self.S = log, device, slots
         self.mix_prefill = mix_prefill
+        self.profile = profile
+        self.phase_ms = {}
         self.gen = torch.Generator().manual_seed(seed)
         t0 = time.perf_counter()
         self.cfg = json.load(open(Path(model_dir) / "config.json"))["talker_config"]
@@ -118,6 +141,9 @@ class NeuronTTSEngine:
             self.proj_l0 = proj(layer0.weight).detach()                                 # [3072, 1024]
             self.proj_res = torch.stack([proj(e.weight) for e in predictor.model.codec_embedding[:-1]]).detach()
         self.small_proj = predictor.small_to_mtp_projection.to(device)
+        self.proj_l0_dev = self.proj_l0.to(device)
+        self.proj_res_dev = torch.cat([self.proj_res, torch.zeros_like(self.proj_res[:1])]).contiguous().to(device)
+        self.sampler = torch.compile(_DeviceSampler(50), backend="neuron", fullgraph=True)
         self.codec_head = talker.codec_head.to(device)
         suppress = torch.zeros(self.cfg["vocab_size"], dtype=torch.bool)
         suppress[2048:] = True
@@ -181,13 +207,50 @@ class NeuronTTSEngine:
         s.blocks = []
         self.slots[s.slot] = None
 
+    @torch.no_grad()
+    def warmup(self):
+        """Compile every talker variant (pps bucket x with/without prefill) + CP/codec/sampler before serving."""
+        t0 = time.perf_counter()
+        S, d, oob = self.S, self.device, self.nblk * self.L
+        for pps in PPS_BUCKETS:
+            for with_pre in (False, True):
+                T = S + (PREFILL_TOKENS if with_pre else 0)
+                groups = [(S, 1, pps)] + ([(1, PREFILL_TOKENS, pps)] if with_pre else [])
+                o0, m0 = build_group_metadata([([], -1, 1)] * S, 1, pps, oob)
+                extra = {}
+                if with_pre:
+                    o1, m1 = build_group_metadata([([], -1, PREFILL_TOKENS)], PREFILL_TOKENS, pps, oob)
+                    extra = dict(offs1=o1.to(d), mask1=m1.to(d))
+                cos, sin = rope_tables(torch.zeros(T, dtype=torch.long), self.theta)
+                talker_step(torch.zeros(2048, T, dtype=torch.bfloat16).to(d), cos.to(d), sin.to(d), **self.tw,
+                            k_cache=self.k_cache, v_cache=self.v_cache, rows_hbm=kv_write_indices([-1] * T, [0] * T, oob).to(d),
+                            offs0=o0.to(d), mask0=m0.to(d), **extra, groups=tuple(groups), eps=self.eps)
+                torch.neuron.synchronize()
+                self.log(f"  warmup talker pps={pps} prefill={with_pre}: {time.perf_counter() - t0:.0f}s")
+        self.submit("Warm up.", "ryan", "english", sampling=Sampling(max_new_tokens=4))
+        while self.step():
+            pass
+        self.stats = {"steps": 0, "step_ms": []}
+        self.phase_ms = {}
+        self.log(f"warmup done in {time.perf_counter() - t0:.0f}s")
+
     def active(self):
         return [s for s in self.slots if s is not None]
+
+    def _mark(self, name, t0):
+        """Profiling only: sync the device and attribute elapsed wall time to a phase."""
+        if not self.profile:
+            return t0
+        torch.neuron.synchronize()
+        now = time.perf_counter()
+        self.phase_ms.setdefault(name, []).append((now - t0) * 1e3)
+        return now
 
     # ----------------------------------------------------------------------------------------------------- step
     @torch.no_grad()
     def step(self):
         t_step = time.perf_counter()
+        tp = t_step
         decoders = [s for s in self.active() if not s.done]
         pre = None
         if self.waiting and any(x is None for x in self.slots):
@@ -241,13 +304,16 @@ class NeuronTTSEngine:
         rows = kv_write_indices(wblk, woff, oob)
         cos, sin = rope_tables(pos, self.theta)
         d = self.device
+        tp = self._mark("host: build talker batch", tp)
         hidden = talker_step(xs.t().contiguous().to(d), cos.to(d), sin.to(d), **self.tw, k_cache=self.k_cache,
                              v_cache=self.v_cache, rows_hbm=rows.to(d), offs0=offs0.to(d), mask0=mask0.to(d), **extra,
                              groups=tuple(groups), eps=self.eps)           # [2048, T]
+        tp = self._mark("talker step (NKI)", tp)
         hT = hidden.t()                                                       # [T, 2048] device
         sel = [s.slot for s in decoders] + ([S + L_ - 1] if pre is not None else [])
         owners = decoders + ([pre] if pre is not None else [])
         logits = self.codec_head(hT).float().cpu()                            # [T, 3072]
+        tp = self._mark("codec_head + D2H", tp)
         for s in decoders:
             s.ctx += 1
             s.step += 1
@@ -282,9 +348,14 @@ class NeuronTTSEngine:
                 if terminal:
                     s.done = True
 
+        tp = self._mark("host: talker sampling", tp)
         # ---- code predictor frame for sampled (non-EOS) slots
         if cp_rows:
-            self._code_predictor(cp_rows, sampled, hT)
+            if any(s.forced is not None for s in cp_rows) or any(s.sampling.sub_top_k != 50 for s in cp_rows):
+                self._code_predictor(cp_rows, sampled, hT)                    # host path (teacher forcing / tests)
+            else:
+                self._code_predictor_device(cp_rows, sampled, hT)
+        tp = self._mark("code predictor (16 NKI steps + host sampling)", tp)
 
         # ---- codec: one frame for every slot (inactive rows decode silence codes; their output is dropped)
         codes = torch.zeros(S, 16, 1, dtype=torch.long)
@@ -295,6 +366,7 @@ class NeuronTTSEngine:
                 emit.append(s)
         if emit:
             wav = self.codec(codes.to(d)).float().cpu()                       # [S, 1, 1920]
+            tp = self._mark("codec frame (front + NKI)", tp)
             now = time.perf_counter()
             for s in emit:
                 s.audio_frames += 1
@@ -319,6 +391,44 @@ class NeuronTTSEngine:
                 t[:, row] = 0
             else:
                 t[row] = 0
+
+    def _code_predictor_device(self, rows, sampled, hT):
+        """16 fused NKI depth steps with on-device sampling: one H2D (uniforms) and one D2H (16 tokens) per frame."""
+        S, d = self.S, self.device
+        tok0 = torch.zeros(S, dtype=torch.long)
+        hid_idx = torch.zeros(S, dtype=torch.long)
+        inv_t = torch.ones(S, 1)
+        greedy = torch.zeros(S, dtype=torch.bool)
+        for s in rows:
+            _, tok, r = sampled[s.slot]
+            tok0[s.slot], hid_idx[s.slot] = tok, r
+            inv_t[s.slot] = 1.0 / s.sampling.sub_temperature
+            greedy[s.slot] = s.sampling.greedy
+        u = torch.rand(CP_STEPS, S, generator=self.gen).to(d)
+        inv_t, greedy, tok0_d = inv_t.to(d), greedy.to(d), tok0.to(d)
+        x = self.small_proj(hT.index_select(0, hid_idx.to(d)))
+        toks = [tok0_d]
+        for st in range(CP_STEPS):
+            logitsT, _ = cp_step(x.t().contiguous(), self.cp_kv, **self.cpw, lm_head=self.cp_heads[max(st - 1, 0)],
+                                 rope=self.cp_rope[st], s=st, eps=self.cp_eps, with_head=True)
+            if st == 0:
+                x = F.embedding(tok0_d, self.proj_l0_dev)
+                continue
+            tok, x = self.sampler(logitsT, u[st], inv_t, greedy, self.proj_res_dev[st - 1])
+            toks.append(tok)
+        frame = torch.stack(toks, 1).cpu()                                      # [S, 16]
+        self._commit_frames(rows, frame)
+
+    def _commit_frames(self, rows, frame):
+        slots = torch.tensor([s.slot for s in rows])
+        f = frame[slots]                                                        # [n, 16]
+        cs = self.codec_emb[f[:, 0]].float()
+        for g in range(1, 16):
+            cs += self.res_emb[g - 1][f[:, g]].float()
+        cs = cs.to(torch.bfloat16)
+        for i, s in enumerate(rows):
+            s.frames.append(f[i].clone())
+            s.codec_sum = cs[i]
 
     def _code_predictor(self, rows, sampled, hT):
         S, d = self.S, self.device
@@ -351,10 +461,4 @@ class NeuronTTSEngine:
                 table = self.proj_l0 if st == 0 else self.proj_res[st - 1]
                 x = table[nxt].to(d)
         frame = torch.stack(toks, 1)                                            # [S, 16]
-        for s in rows:
-            f = frame[s.slot]
-            s.frames.append(f.clone())
-            cs = self.codec_emb[f[0]].float()
-            for g in range(1, 16):
-                cs += self.res_emb[g - 1][f[g]].float()
-            s.codec_sum = cs.to(torch.bfloat16)
+        self._commit_frames(rows, frame)
