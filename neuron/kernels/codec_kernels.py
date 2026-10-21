@@ -91,14 +91,24 @@ def _snake_terms(x, alpha_over_pi, inv_beta_sqrt, shape, cast_engine, fp32_s2=Fa
     return xb, s2
 
 
+def _carry_history(new_hist, hist, x, b, c0, cs, halo, T):
+    """new_hist[b] = last ``halo`` samples of cat(hist[b], x[b]) for channels [c0, c0+cs) (HBM -> HBM)."""
+    if T >= halo:
+        nisa.dma_copy(dst=new_hist[b, c0:c0 + cs, :], src=x[b, c0:c0 + cs, T - halo:T])
+    else:
+        nisa.dma_copy(dst=new_hist[b, c0:c0 + cs, 0:halo - T], src=hist[b, c0:c0 + cs, T:halo])
+        nisa.dma_copy(dst=new_hist[b, c0:c0 + cs, halo - T:halo], src=x[b, c0:c0 + cs, :])
+
+
 @nki.jit
 def residual_unit(x, alpha1, inv_beta_sqrt1, w1, b1, alpha2, inv_beta_sqrt2, w2, b2, dilation: int,
-                  split_snake: bool = True):
-    """Fused DecoderResidualUnit, whole-sequence causal (zero left history).
+                  split_snake: bool = True, hist=None):
+    """Fused DecoderResidualUnit, causal. ``hist`` [B, C, 6*dilation] = the previous chunk's last input samples
+    (streaming; returns (y, new_hist)); without it the left context is zero (whole sequence; returns y).
 
     x [B, C, T] fp32 -> y [B, C, T] fp32 with
     y = conv2(snake2(conv1(snake1(x)))) + x, conv1: K=7 dilated causal, conv2: K=1.
-    Weights from ``residual_unit_params``. T % T_TILE == 0 or T < T_TILE. ``split_snake``: feed SnakeBeta's two terms
+    Weights from ``residual_unit_params``. Any T (last tile may be partial). ``split_snake``: feed SnakeBeta's two terms
     as separate matmuls (VectorE-bound units, C <= 192) vs one fused add (TensorE-bound, C >= 384).
     """
     B, C, T = x.shape
@@ -124,14 +134,16 @@ def residual_unit(x, alpha1, inv_beta_sqrt1, w1, b1, alpha2, inv_beta_sqrt2, w2,
 
     snake = _snake_terms if split_snake else _snake_fused
 
-    def tile(b, t0, first: bool):
+    def tile(b, t0, first: bool, tt=tt):  # tt: this tile's static length (last tile may be partial)
         # snake1(x) over [t0 - halo, t0 + tt); the first tile's left context is causal zero padding.
         act1, xres = [], []
         for ci, (c0, cs) in enumerate(tiles):
             xw = nl.ndarray((cs, halo + tt), dtype=nl.float32, buffer=nl.sbuf)
             if first:
-                if halo:
+                if halo and hist is None:
                     nisa.memset(dst=xw[:, 0:halo], value=0.0)
+                elif halo:
+                    nisa.dma_copy(dst=xw[:, 0:halo], src=hist[b, c0:c0 + cs, :])
                 nisa.dma_copy(dst=xw[:, halo:halo + tt], src=x[b, c0:c0 + cs, 0:tt])
             else:
                 nisa.dma_copy(dst=xw, src=x[b, c0:c0 + cs, t0 - halo:t0 + tt])
@@ -165,11 +177,20 @@ def residual_unit(x, alpha1, inv_beta_sqrt1, w1, b1, alpha2, inv_beta_sqrt2, w2,
             nisa.tensor_tensor(dst=y2, data1=y, data2=xres[co][:, halo:halo + tt], op=nl.add)
             nisa.dma_copy(dst=out[b, o0:o0 + os_, t0:t0 + tt], src=y2)
 
+    nfull, rem = T // tt, T % tt
     for b in nl.affine_range(B):
         tile(b, 0, True)
-        for t in nl.affine_range(1, T // tt):
+        for t in nl.affine_range(1, nfull):
             tile(b, t * tt, False)
-    return out
+        if rem:
+            tile(b, nfull * tt, False, rem)
+    if hist is None:
+        return out
+    new_hist = nl.ndarray((B, C, halo), dtype=x.dtype, buffer=nl.shared_hbm)
+    for b in nl.affine_range(B):
+        for c0, cs in tiles:
+            _carry_history(new_hist, hist, x, b, c0, cs, halo, T)
+    return out, new_hist
 
 
 def transconv_weight_taps(conv):
@@ -189,13 +210,14 @@ SBUF_WEIGHT_BUDGET = 96 * 1024  # bytes per partition for resident weights (SBUF
 
 
 @nki.jit
-def snake_transconv(x, alpha, inv_beta_sqrt, w, b, rate: int, split_snake: bool = True):
+def snake_transconv(x, alpha, inv_beta_sqrt, w, b, rate: int, split_snake: bool = True, hist=None):
     """Fused SnakeBeta + causal ConvTranspose1d(kernel=2*rate, stride=rate), whole-sequence.
 
     x [B, Cin, Tin] fp32 -> y [B, Cout, Tin*rate] fp32. Output phase m of input step n:
     y[:, n*rate + m] = W[:, :, m].T x[n] + W[:, :, m + rate].T x[n - 1] + b   (x[-1] = 0, causal)
-    which equals upstream ConvTranspose1d followed by trimming ``rate`` samples on the right.
-    Tin % T_TILE == 0 or Tin < T_TILE.
+    which equals upstream ConvTranspose1d followed by trimming ``rate`` samples on the right. Streaming: ``hist``
+    [B, Cin, 1] = previous chunk's last input step (returns (y, new_hist)); otherwise x[-1] = 0.
+    Any Tin (last tile may be partial).
     """
     B, Cin, Tin = x.shape
     K, Cout = w.shape[1], w.shape[2]
@@ -227,13 +249,16 @@ def snake_transconv(x, alpha, inv_beta_sqrt, w, b, rate: int, split_snake: bool 
             nisa.dma_copy(dst=bt, src=b[o0:o0 + os_])
             b_sb.append(bt)
 
-        def tile(bi, n0, first: bool):
+        def tile(bi, n0, first: bool, tt=tt):
             # snake(x) over input steps [n0 - 1, n0 + tt): one step of left context for the k >= rate taps.
             terms = []
             for ci, (c0, cs) in enumerate(ci_tiles):
                 xw = nl.ndarray((cs, 1 + tt), dtype=nl.float32, buffer=nl.sbuf)
                 if first:
-                    nisa.memset(dst=xw[:, 0:1], value=0.0)
+                    if hist is None:
+                        nisa.memset(dst=xw[:, 0:1], value=0.0)
+                    else:
+                        nisa.dma_copy(dst=xw[:, 0:1], src=hist[bi, c0:c0 + cs, :])
                     nisa.dma_copy(dst=xw[:, 1:1 + tt], src=x[bi, c0:c0 + cs, 0:tt])
                 else:
                     nisa.dma_copy(dst=xw, src=x[bi, c0:c0 + cs, n0 - 1:n0 + tt])
@@ -253,11 +278,20 @@ def snake_transconv(x, alpha, inv_beta_sqrt, w, b, rate: int, split_snake: bool 
                     nisa.tensor_scalar(dst=y[:, :, m], data=acc, op0=nl.add, operand0=b_sb[gi])
                 nisa.dma_copy(dst=out[bi, o0:o0 + os_, n0 * rate:(n0 + tt) * rate], src=y.reshape((os_, tt * rate)))
 
+        nfull, rem = Tin // tt, Tin % tt
         for bi in nl.affine_range(B):
             tile(bi, 0, True)
-            for t in nl.affine_range(1, Tin // tt):
+            for t in nl.affine_range(1, nfull):
                 tile(bi, t * tt, False)
-    return out
+            if rem:
+                tile(bi, nfull * tt, False, rem)
+    if hist is None:
+        return out
+    new_hist = nl.ndarray((B, Cin, 1), dtype=x.dtype, buffer=nl.shared_hbm)
+    for bi in nl.affine_range(B):
+        for c0, cs in ci_tiles:
+            _carry_history(new_hist, hist, x, bi, c0, cs, 1, Tin)
+    return out, new_hist
 
 
 def snake_conv_out_params(snake, conv_net):
@@ -268,10 +302,11 @@ def snake_conv_out_params(snake, conv_net):
 
 
 @nki.jit
-def snake_conv_out(x, alpha, inv_beta_sqrt, w, b):
+def snake_conv_out(x, alpha, inv_beta_sqrt, w, b, hist=None):
     """Decoder tail: clamp(conv(SnakeBeta(x)), -1, 1), conv Cin->1, K=7 causal; whole-sequence.
 
     x [B, Cin<=128, T] fp32 -> wav [B, 1, T] fp32. Snake terms fed as separate matmuls (VectorE-bound).
+    Streaming: ``hist`` [B, Cin, 6] (returns (wav, new_hist)).
     """
     B, C, T = x.shape
     K = w.shape[1]
@@ -286,10 +321,13 @@ def snake_conv_out(x, alpha, inv_beta_sqrt, w, b):
     b_sb = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
     nisa.dma_copy(dst=b_sb, src=b)
 
-    def tile(bi, t0, first: bool):
+    def tile(bi, t0, first: bool, tt=tt):
         xw = nl.ndarray((C, halo + tt), dtype=nl.float32, buffer=nl.sbuf)
         if first:
-            nisa.memset(dst=xw[:, 0:halo], value=0.0)
+            if hist is None:
+                nisa.memset(dst=xw[:, 0:halo], value=0.0)
+            else:
+                nisa.dma_copy(dst=xw[:, 0:halo], src=hist[bi, :, :])
             nisa.dma_copy(dst=xw[:, halo:halo + tt], src=x[bi, :, 0:tt])
         else:
             nisa.dma_copy(dst=xw, src=x[bi, :, t0 - halo:t0 + tt])
@@ -306,8 +344,16 @@ def snake_conv_out(x, alpha, inv_beta_sqrt, w, b):
         nisa.tensor_scalar(dst=y2, data=y, op0=nl.maximum, operand0=-1.0)
         nisa.dma_copy(dst=out[bi, :, t0:t0 + tt], src=y2)
 
+    nfull, rem = T // tt, T % tt
     for bi in nl.affine_range(B):
         tile(bi, 0, True)
-        for t in nl.affine_range(1, T // tt):
+        for t in nl.affine_range(1, nfull):
             tile(bi, t * tt, False)
-    return out
+        if rem:
+            tile(bi, nfull * tt, False, rem)
+    if hist is None:
+        return out
+    new_hist = nl.ndarray((B, C, halo), dtype=x.dtype, buffer=nl.shared_hbm)
+    for bi in nl.affine_range(B):
+        _carry_history(new_hist, hist, x, bi, 0, C, halo, T)
+    return out, new_hist
