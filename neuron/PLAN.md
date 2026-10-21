@@ -203,6 +203,16 @@ One NKI kernel per depth step: 5 layers + final norm + lm_head, KV slot written 
   /step at 128-wide blocks (≈ the fp8 saving). Kept as opt-in per group (`cp_step_params(fp8=[...])`);
   revisit with audio-level evaluation or K=512 blocks.
 
+### Talker fused step — dense path (`kernels/talker_kernels.py: talker_dense_step`, attention stubbed)
+- One launch for all 28 layers over a MIXED token batch of T tokens (decode + prefill chunks).
+- Per-token RoPE: rotate_half is a fixed partition permutation → `rotate_half(w*x) = (Perm diag(w)) x`
+  as one fp32 matmul for all heads/tokens; host passes per-token cos/sin [128, T]. 1-layer check vs
+  torch: 3.0e-3 rel L2.
+- 28-layer weight stream (2.82 GB bf16): **T=32 11.65 ms (242 GB/s, 94% of peak)**, T=64 11.82 ms,
+  T=128 12.90 ms. → adding 96 prefill tokens to a 32-stream decode step costs ~1.25 ms: fused mixed
+  prefill+decode is nearly free on the dense side; only attention scales with tokens x context.
+- Target with paged attention: ~11.7 + KV read (1.9 GB @ ctx 512 ≈ 7.3 ms) ≈ 19 ms vs 29.6 compiled.
+
 ### Running total per frame-batch (B=32 per core)
 talker 29.6 (compiled) + CP 32.1 (compiled) + codec 9.4 (NKI) = 71.1 ms →
 talker 29.6 (compiled) + **CP 12.6 (NKI)** + codec 9.4 (NKI) = **51.6 ms vs 80 ms budget**.
