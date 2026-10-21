@@ -63,8 +63,26 @@ Rules learned:
   layer 27 and Neuron to 56% → synthetic inputs are ill-conditioned, not a Neuron bug.
   Open item: Neuron error jumps 3× vs CPU at layer 2 — recheck with real prefill KV.
 
+### Codec prototype (`proto/codec_chunk.py`, upstream whole-sequence decoder, B=32, 12 frames)
+- fp32 (repo default): 449.5 ms / chunk = **37.5 ms per frame-batch**, SNR 111.7 dB vs CPU fp32,
+  compile 876 s. fp32 TensorE is ~4x slower than bf16 → bf16 run pending.
+
 ### Baseline per frame-batch (B=32 per core, compiler codegen, no NKI)
-Talker 29.6 + CP 32.1 = 61.7 ms + codec (TBD) vs 80 ms real-time budget → kernels are required.
+Talker 29.6 + CP 32.1 + codec 37.5 (fp32) = **99.2 ms vs 80 ms real-time budget** → kernels required.
+
+### CP step profile deep-dive
+- ~5,100 tiny TensorE transposes (16x16 / x2) per step from attention reshapes (GQA
+  repeat_interleave, head layout) — layout overhead, not math.
+- On NeuronCore-v2 MM cost = max(N, 64 cycles): with 32 tokens, weights-stationary is already the
+  cheaper mapping; the win is removing transposes + fusing ACTIVATE-level small ops.
+
+### NKI-Lib on inf2
+- `nkilib.core.mlp.mlp` (TKG, fused add+RMSNorm+SwiGLU, 32x1024x3072): **fails to compile on gen2**
+  — SBUF allocation out of bounds (`SB<0,204288>` > 192 KiB/partition). Sized for trn2+.
+  → Write our own inf2 kernels; use NKI-Lib as algorithm reference only.
+- torch.compile MLP alone at that shape: 183 µs/call (46 µs bandwidth floor + launch overhead).
+
+6. One process grabs BOTH NeuronCores by default → always set `NEURON_RT_VISIBLE_CORES`.
 
 4. Disable dynamo `automatic_dynamic_shapes` — a second batch bucket for the same module otherwise
    recompiles with dynamic dims, which neuronx-cc cannot lower.
