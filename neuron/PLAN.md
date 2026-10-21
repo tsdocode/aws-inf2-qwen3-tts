@@ -147,8 +147,35 @@ mirroring executor/build.py, host-copy PCM pool.
 - Host CPU: only 4 vCPU — profile the Python planner/staging; move per-step metadata building
   (KV page tables, pinned allocs) to preallocated buffers.
 
+### Codec NKI kernels (`kernels/codec_kernels.py`, `kernels/codec_decoder.py`) — DONE (whole-sequence)
+Hybrid decoder: compiled frame-rate front + NKI audio-rate blocks. B=32, 16-frame chunks, golden codes:
+
+| Decoder | ms / frame-batch | audio SNR vs upstream fp32 |
+|---|---|---|
+| compiled fp32 (baseline) | 37.5 | 111.7 dB |
+| compiled bf16 | 29.2 | 24.9 dB |
+| **NKI hybrid, fp32 front** | **9.4** | **52.6 dB** (worst row 50.0) |
+| NKI hybrid, bf16 front (`front_bf16`) | 8.4 | 41.5 dB (worst row 39.1) — needs listening test |
+
+Kernels (all validated per block on real activations, 51–59 dB vs upstream fp32):
+- `residual_unit`: SnakeBeta → dilated K=7 conv → SnakeBeta → 1x1 conv → +res, one pass. Channels on
+  partitions, conv = K shifted accumulating matmuls (free-axis offsets). C=768: 383 µs device,
+  TensorE 79% (~50 TF/s). For C ≤ 192 SnakeBeta's two terms go to TensorE as separate matmuls
+  (conv is linear) — takes the add off the VectorE bottleneck (block3 2.73 → 1.88 ms device).
+- `snake_transconv`: SnakeBeta + causal ConvTranspose1d via phase decomposition
+  `y[n*r+m] = W_m^T x[n] + W_{m+r}^T x[n-1]`; weights in SBUF in output-channel groups (block0 37.7 MB).
+- `snake_conv_out`: tail SnakeBeta(96) + conv 96→1 + clamp: 46 → 8 ms per chunk.
+inf2 gotchas: ScalarE sin valid only on [-π, π] and |αx| reaches 142 → range-reduce with the fp32
+round trick `(q + 1.5·2^23) − 1.5·2^23` (VectorE has no fmod); Copy activation takes only immediate
+bias (use VectorE tensor_scalar for per-channel bias); GpSimd rejects fp32 tensor_tensor (NCC_IXCG965)
+but does casts fine; `torch.neuron.synchronize()` for timing (D2H of block outputs is hundreds of MB).
+TODO: streaming mode — feed conv histories / transconv overlap as kernel inputs instead of zeros.
+
+### Running total per frame-batch (B=32 per core)
+talker 29.6 (compiled) + CP 32.1 (compiled) + codec 9.4 (NKI) = **71.1 ms vs 80 ms budget**.
+
 ### Revised priority (2026-10-21, after baselines)
-1. **Codec fused conv + SnakeBeta kernel** (bf16 matmul / fp32 snake): 29–37 ms → target < 8 ms.
+1. ~~Codec fused conv + SnakeBeta kernel~~ done: 37.5 → 9.4 ms (fp32 front) / 8.4 ms (bf16 front).
 2. **FP8 decode linear** (talker + CP): measure fp8 TensorE speed + quality on inf2.
 3. Placement: TP=2 vs stage split vs DP — measure inf2 all-reduce latency first.
 4. CP fused step kernel (attention ≤16, in-kernel KV write, no transposes); talker paged attention.
