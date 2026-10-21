@@ -45,16 +45,16 @@ def main():
     for c in ctxs:
         blocks = [perm.pop() for _ in range((c + 1 + PAGE - 1) // PAGE)]
         dec.append((blocks, c, 1)); wblk.append(blocks[c // PAGE]); woff.append(c % PAGE); pos.append(c)
-    groups, metas = [(a.decode, 1, pps)], list(build_group_metadata(dec, 1, pps, nblk))
+    groups, metas = [(a.decode, 1, pps)], list(build_group_metadata(dec, 1, pps, nblk * L))
     if a.prefill:
         pctx = max(0, a.max_ctx - a.prefill - 1) // 2
         blocks = [perm.pop() for _ in range((pctx + a.prefill + PAGE - 1) // PAGE)]
         groups.append((1, a.prefill, pps))
-        metas += list(build_group_metadata([(blocks, pctx, a.prefill)], a.prefill, pps, nblk))
+        metas += list(build_group_metadata([(blocks, pctx, a.prefill)], a.prefill, pps, nblk * L))
         for t in range(pctx, pctx + a.prefill):
             wblk.append(blocks[t // PAGE]); woff.append(t % PAGE); pos.append(t)
     T = len(pos)
-    rows = kv_write_indices(wblk, woff, nblk)
+    rows = kv_write_indices(wblk, woff, nblk * L)
     cos, sin = rope_tables(torch.tensor(pos), theta)
     dev = lambda t: t.contiguous().to("neuron")  # noqa: E731
     d = {k: dev(v) for k, v in prm.items()}

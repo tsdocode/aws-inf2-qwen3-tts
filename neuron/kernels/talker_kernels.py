@@ -165,9 +165,10 @@ def build_group_metadata(seqs, qps, pps, num_blocks):
     Returns pages [1, nseg*pps] int32 block ids (pages are contiguous in HBM, gathered with one runtime
     ``scalar_offset`` each: 243 GB/s vs ~127 GB/s for per-partition ``vector_select`` on gen2) and the additive mask
     [128, nseg, pps, qps] fp32 (key k of page i at position i*128 + k is visible iff <= query position).
-    Padding pages get id ``num_blocks`` (just past the cache): the DMA skips them (oob_mode.skip). Must be the
-    *first* out-of-range id — a huge sentinel overflows the 32-bit element offset (id * 131072) and wraps
-    back in bounds, silently reading real cache memory.
+    Padding pages get id ``num_blocks``: the DMA skips them (oob_mode.skip). For the per-layer views of a stacked
+    [L, NBLK, ...] cache pass num_blocks = L * NBLK: the out-of-bounds check is against the whole allocation, NOT
+    the view, so id NBLK of layer l would silently hit layer l+1's block 0. (Keep it small enough that id * 131072
+    elements fits int32, or it wraps back in bounds.)
     """
     nseg = len(seqs)
     offs = torch.zeros(1, nseg * pps, dtype=torch.int32)
@@ -184,7 +185,7 @@ def build_group_metadata(seqs, qps, pps, num_blocks):
 
 
 def _attend_group(q, att, tok0, nseg, qps, pps, offs_hbm, mask_hbm, k_pages, v_pages, ones_bf, ident_f32, seg_chunk,
-                  dbg=None, ident_bf=None):
+                  dbg=None, ident_bf=None, tag=None):
     """Paged attention for one static group, writes att[:, h, tok0 + s*qps + j] (bf16, [D, NH, T] layout)."""
     NH, KVH = 16, 8
     lanes = 2 * qps                                            # 2 query heads per KV head x query tokens
@@ -213,12 +214,14 @@ def _attend_group(q, att, tok0, nseg, qps, pps, offs_hbm, mask_hbm, k_pages, v_p
         kp = kbufs[ci % 2]                                     # [key, page, (g, d)]  token-major like V
         vp = vbufs[ci % 2]                                     # [key, page, (g, d)]
         for i in nl.static_range(npg):
+            nk = None if tag is None else f"kvg_{tag}_{ci}_{i}_k"
+            nv = None if tag is None else f"kvg_{tag}_{ci}_{i}_v"
             nisa.dma_copy(dst=kp[:, i, :], src=k_pages.ap(pattern=[[8 * HEAD_DIM, P], [1, 8 * HEAD_DIM]], offset=0,
                                                           scalar_offset=offs[0:1, i:i + 1], indirect_dim=0),
-                          oob_mode=nisa.oob_mode.skip)
+                          oob_mode=nisa.oob_mode.skip, name=nk)
             nisa.dma_copy(dst=vp[:, i, :], src=v_pages.ap(pattern=[[8 * HEAD_DIM, P], [1, 8 * HEAD_DIM]], offset=0,
                                                           scalar_offset=offs[0:1, i:i + 1], indirect_dim=0),
-                          oob_mode=nisa.oob_mode.skip)
+                          oob_mode=nisa.oob_mode.skip, name=nv)
         kp4 = kp.reshape((P, max_npg, KVH, HEAD_DIM))
         vp4 = vp.reshape((P, max_npg, KVH, HEAD_DIM))
         for g in nl.static_range(KVH):
@@ -342,15 +345,17 @@ def paged_attention(q_hbm, k_cache, v_cache, offs0, mask0, offs1=None, mask1=Non
 # ======================================================================================= full talker step
 def kv_write_indices(blocks_per_token, offset_per_token, num_blocks):
     """Host: per-token cache row (row = blk*PAGE + off of the token-major [NBLK*PAGE, KVH*D] view, same for K and
-    V) as [T, 1] int32 (tokens on partitions for the scatter DMA). Padding tokens (block < 0) get the first
-    out-of-range row so their writes are skipped."""
+    V) as [T, 1] int32 (tokens on partitions for the scatter DMA). Padding tokens (block < 0) get an out-of-range
+    row so their writes are skipped. ``num_blocks`` must cover the WHOLE stacked cache (L * NBLK): the bounds check
+    is against the allocation, not the per-layer view, so row NBLK*PAGE of layer l is layer l+1's block 0 — that bug
+    overwrote token 0 of whichever stream owned block 0, in every layer, on every step with padding rows."""
     blk = torch.as_tensor(blocks_per_token).long()
     off = torch.as_tensor(offset_per_token).long()
     rows = torch.where(blk < 0, num_blocks * PAGE, blk * PAGE + off)
     return rows.int().reshape(-1, 1).contiguous()
 
 
-def _write_kv(k, v, T, rows_hbm, k_rows, v_rows, ident_bf):
+def _write_kv(k, v, T, rows_hbm, k_rows, v_rows, ident_bf, tag=""):
     """Write this step's T tokens of K and V ([D, KVH, T] each) into the token-major paged caches.
 
     Each token is ONE contiguous 2 KiB row, and a whole 128-token chunk is ONE scatter DMA (tokens on
@@ -362,14 +367,15 @@ def _write_kv(k, v, T, rows_hbm, k_rows, v_rows, ident_bf):
         tn = min(P, T - t0)
         idx = nl.ndarray((tn, 1), dtype=nl.int32, buffer=nl.sbuf)
         nisa.dma_copy(dst=idx, src=rows_hbm[t0:t0 + tn, :])
-        for src, rows in ((k, k_rows), (v, v_rows)):
+        for kvn, src, rows in (("k", k, k_rows), ("v", v, v_rows)):
             tok = nl.ndarray((tn, KVH, HEAD_DIM), dtype=nl.bfloat16, buffer=nl.sbuf)
             for h in nl.static_range(KVH):
                 tp = nl.ndarray((tn, HEAD_DIM), dtype=nl.float32, buffer=nl.psum)
                 nisa.nc_matmul(dst=tp, stationary=src[:, h, t0:t0 + tn], moving=ident_bf)
                 nisa.tensor_copy(dst=tok[:, h, :], src=tp)
             nisa.dma_copy(dst=rows.ap(pattern=[[KVH * HEAD_DIM, tn], [1, KVH * HEAD_DIM]], offset=0, vector_offset=idx,
-                                      indirect_dim=0), src=tok.reshape((tn, KVH * HEAD_DIM)), oob_mode=nisa.oob_mode.skip)
+                                      indirect_dim=0), src=tok.reshape((tn, KVH * HEAD_DIM)), oob_mode=nisa.oob_mode.skip,
+                          name=f"kvw_{tag}_{t0}_{kvn}")
 
 
 @nki.jit
@@ -413,7 +419,7 @@ def talker_step(xT, cos_hbm, sin_hbm, ln1, qkv, qn_w, kn_w, q_rot, k_rot, o, ln2
         k_rows = k_cache[l].reshape((NBLK * PAGE, KVH * HEAD_DIM))
         v_rows = v_cache[l].reshape((NBLK * PAGE, KVH * HEAD_DIM))
         if do_kv_write:
-            _write_kv(k, v, T, rows_hbm, k_rows, v_rows, ident_bf)
+            _write_kv(k, v, T, rows_hbm, k_rows, v_rows, ident_bf, tag=str(l))
         att = nl.ndarray((P, NH, T), dtype=nl.bfloat16, buffer=nl.sbuf)
         if not do_attention:  # ablation only: keep q/k/v live without attention
             for h in nl.static_range(NH):
@@ -423,7 +429,7 @@ def talker_step(xT, cos_hbm, sin_hbm, ln1, qkv, qn_w, kn_w, q_rot, k_rot, o, ln2
         tok0 = 0
         for gi, (nseg, qps, pps) in enumerate(groups if do_attention else ()):
             _attend_group(q, att, tok0, nseg, qps, pps, meta[gi][0], meta[gi][1], k_pages, v_pages, ones_bf, ident_f32,
-                          seg_chunk, ident_bf=ident_bf)
+                          seg_chunk, ident_bf=ident_bf, tag=f"{l}_{gi}")
             tok0 += nseg * qps
         attn_out = _linear(att, NH, o[l], T, nl.bfloat16)
         x = _add_residual(x, attn_out, KT, T)
@@ -441,3 +447,21 @@ def talker_step(xT, cos_hbm, sin_hbm, ln1, qkv, qn_w, kn_w, q_rot, k_rot, o, ln2
     hidden = nl.ndarray((H, T), dtype=nl.bfloat16, buffer=nl.shared_hbm)
     nisa.dma_copy(dst=hidden.reshape((KT, P, T)).permute((1, 0, 2)), src=xf)
     return hidden
+
+
+def talker_step_scheduled(groups, T, L, seg_chunk=4, do_kv_write=True, do_attention=True):
+    """``talker_step`` with explicit read-after-write edges: every page gather of layer l waits (hardware semaphore)
+    for layer l's K/V scatter writes. The writes and gathers address the cache through runtime offsets, so the
+    compiler cannot see that they alias and may otherwise reorder them -> stale keys (measured: a fresh prefill
+    chunk, whose keys all come from this step's writes, was 13-18% off)."""
+    edges = []
+    if do_kv_write and do_attention:
+        for l in range(L):
+            writes = [f"kvw_{l}_{t0}_{kv}" for t0 in range(0, T, P) for kv in ("k", "v")]
+            for gi, (nseg, qps, pps) in enumerate(groups):
+                for ci, c0 in enumerate(range(0, nseg, seg_chunk)):
+                    npg = min(seg_chunk, nseg - c0) * pps
+                    for i in range(npg):
+                        for kv in ("k", "v"):
+                            edges.append((f"kvg_{l}_{gi}_{ci}_{i}_{kv}", writes))
+    return talker_step.with_schedule(edges, kind=nisa.dependency.runtime) if edges else talker_step

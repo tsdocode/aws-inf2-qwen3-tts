@@ -70,6 +70,8 @@ class Stream:
     t_first_audio: float = None
     t_done: float = None
     audio_frames: int = 0
+    forced: torch.Tensor = None                    # teacher forcing (tests): [n, 16] frames to feed instead of samples
+    pred: list = field(default_factory=list)       # teacher forcing: model's own pick per frame [16]
 
 
 def _sample(logits, temperature, top_k, top_p, greedy, gen):
@@ -88,12 +90,13 @@ def _sample(logits, temperature, top_k, top_p, greedy, gen):
 
 
 class NeuronTTSEngine:
-    def __init__(self, model_dir, slots=32, device="neuron", seed=0, log=print):
+    def __init__(self, model_dir, slots=32, device="neuron", seed=0, log=print, mix_prefill=True):
         from nari_qwen3_tts.config import ModelAssetConfig
         from nari_qwen3_tts.model.checkpoint import CheckpointLoader
         from transformers import Qwen2TokenizerFast
 
         self.log, self.device, self.S = log, device, slots
+        self.mix_prefill = mix_prefill
         self.gen = torch.Generator().manual_seed(seed)
         t0 = time.perf_counter()
         self.cfg = json.load(open(Path(model_dir) / "config.json"))["talker_config"]
@@ -157,12 +160,13 @@ class NeuronTTSEngine:
         return torch.stack([self._p_cache[i] for i in ids])
 
     def submit(self, text, speaker="ryan", language="auto", instruct="", non_streaming_mode=True, sampling=None,
-               sink=None):
+               sink=None, forced=None):
         prompt = build_prompt(self.tok, self.cfg, text, speaker, language, instruct, non_streaming_mode)
         if len(prompt.text_ids) > PREFILL_TOKENS:
             raise ValueError(f"prompt of {len(prompt.text_ids)} tokens > {PREFILL_TOKENS} (chunked prefill TODO)")
         s = Stream(self.next_rid, prompt, sampling or Sampling(), sink, time.perf_counter())
         s.seen = torch.zeros(self.cfg["vocab_size"], dtype=torch.bool)
+        s.forced = forced
         self.next_rid += 1
         self.waiting.append(s)
         return s
@@ -191,6 +195,8 @@ class NeuronTTSEngine:
             pre.slot = self.slots.index(None)
             self.slots[pre.slot] = pre
             self._reset_codec_row(pre.slot)
+            if not self.mix_prefill:
+                decoders = []                                   # debug: prefill-only step (no mixed batch)
         if not decoders and pre is None and not self.active():
             return False
 
@@ -223,15 +229,16 @@ class NeuronTTSEngine:
             woff += [t % PAGE for t in range(L_)] + [0] * (PREFILL_TOKENS - L_)
             max_ctx = max(max_ctx, L_)
         pps = next(b for b in PPS_BUCKETS if b * PAGE >= max_ctx)
-        offs0, mask0 = build_group_metadata(dec_meta, 1, pps, self.nblk)
+        oob = self.nblk * self.L               # out of range for the WHOLE stacked cache, not just one layer's view
+        offs0, mask0 = build_group_metadata(dec_meta, 1, pps, oob)
         groups.append((S, 1, pps))
         extra = {}
         if pre is not None:
             # prefill queries j >= L_ are padding: give them no visible keys
-            offs1, mask1 = build_group_metadata([(pre.blocks, 0, L_)], PREFILL_TOKENS, pps, self.nblk)
+            offs1, mask1 = build_group_metadata([(pre.blocks, 0, L_)], PREFILL_TOKENS, pps, oob)
             groups.append((1, PREFILL_TOKENS, pps))
             extra = dict(offs1=offs1.to(self.device), mask1=mask1.to(self.device))
-        rows = kv_write_indices(wblk, woff, self.nblk)
+        rows = kv_write_indices(wblk, woff, oob)
         cos, sin = rope_tables(pos, self.theta)
         d = self.device
         hidden = talker_step(xs.t().contiguous().to(d), cos.to(d), sin.to(d), **self.tw, k_cache=self.k_cache,
@@ -260,6 +267,10 @@ class NeuronTTSEngine:
                 lg[s.seen] = torch.where(v > 0, v / p, v * p)
             tok = int(_sample(lg.unsqueeze(0), s.sampling.temperature, s.sampling.top_k, s.sampling.top_p,
                               s.sampling.greedy, self.gen)[0])
+            if s.forced is not None:                                          # teacher forcing: record, then override
+                s.pred.append([tok])
+                f_i = len(s.frames)
+                tok = int(s.forced[f_i, 0]) if f_i < len(s.forced) else CODEC_EOS
             s.seen[tok] = True
             s.n_sampled += 1
             terminal = tok == CODEC_EOS or s.step + 1 >= max(2, s.sampling.max_new_tokens)
@@ -332,6 +343,9 @@ class NeuronTTSEngine:
                 for s in rows:
                     nxt[s.slot] = _sample(lg[s.slot:s.slot + 1], s.sampling.sub_temperature, s.sampling.sub_top_k, 1.0,
                                           s.sampling.greedy, self.gen)[0]
+                    if s.forced is not None:
+                        s.pred[-1].append(int(nxt[s.slot]))
+                        nxt[s.slot] = s.forced[len(s.frames), st]
                 toks.append(nxt)
             if st < CP_STEPS - 1:
                 table = self.proj_l0 if st == 0 else self.proj_res[st - 1]

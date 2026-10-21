@@ -19,15 +19,22 @@ MODEL = str(Path.home() / "models/Qwen3-TTS-12Hz-1.7B-CustomVoice")
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--slots", type=int, default=4)
+    ap.add_argument("--only", default=None)
+    ap.add_argument("--teacher", action="store_true", help="teacher-force golden frames; report per-step agreement")
+    ap.add_argument("--no-mix", action="store_true")
     a = ap.parse_args()
     torch._dynamo.config.automatic_dynamic_shapes = False
-    eng = NeuronTTSEngine(MODEL, slots=a.slots)
+    eng = NeuronTTSEngine(MODEL, slots=a.slots, mix_prefill=not a.no_mix)
     meta = json.loads((GOLDEN / "meta.json").read_text())
     streams, audio = {}, {}
     for name, m in meta.items():
+        if a.only and name != a.only:
+            continue
         audio[name] = []
         sink = (lambda name: (lambda pcm: audio[name].append(pcm) if pcm is not None else None))(name)
-        streams[name] = eng.submit(m["text"], m["speaker"], m["language"], sampling=Sampling(greedy=True), sink=sink)
+        forced = torch.load(GOLDEN / f"{name}.codes.pt") if a.teacher else None
+        streams[name] = eng.submit(m["text"], m["speaker"], m["language"], sampling=Sampling(greedy=True), sink=sink,
+                                   forced=forced)
     t0 = time.perf_counter()
     while eng.step():
         if eng.stats["steps"] % 20 == 0:
@@ -46,6 +53,15 @@ def main():
         print(f"{name}: frames neuron {len(got)} vs golden {len(gold)} | first {first_bad} frames exact | "
               f"codebook-0 match {g0:.0f}% | all-code match {allg:.0f}% | TTFA {(s.t_first_audio - s.t_submit) * 1e3:.0f} ms "
               f"(incl. compile on first run) | audio {len(wav) / 24000:.2f}s")
+        if a.teacher:
+            pred = torch.tensor([p for p in s.pred if len(p) == 16])
+            n = min(len(pred), len(gold))
+            agree = (pred[:n] == gold[:n]).float().mean(0) * 100
+            print(f"    teacher-forced agreement: talker cb0 {agree[0]:.0f}% | CP groups 1-15 mean {agree[1:].mean():.0f}% "
+                  f"(min {agree[1:].min():.0f}%) over {n} frames; EOS predicted at the golden end: "
+                  f"{len(s.pred) > len(gold) and s.pred[len(gold)][0] == 2150}")
+            per = (pred[:n] == gold[:n]).float().mean(1) * 100
+            print("    per-frame agreement (all 16 codes):", " ".join(f"{v:.0f}" for v in per.tolist()))
     ms = eng.stats["step_ms"]
     print(f"{eng.stats['steps']} steps in {wall:.0f}s; steady step median {np.median(ms[len(ms) // 2:]):.1f} ms")
 
