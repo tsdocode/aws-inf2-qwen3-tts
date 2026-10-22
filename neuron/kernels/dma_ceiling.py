@@ -3,8 +3,7 @@
 Streams a [NB, 128, F] tensor block by block into SBUF; reduces one element per block so the loads
 are not dead code. Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/kernels/dma_ceiling.py --mb 8 --free 8192
 """
-import argparse, sys, time
-from pathlib import Path
+import argparse
 
 import nki
 import nki.isa as nisa

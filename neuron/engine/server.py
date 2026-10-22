@@ -17,13 +17,14 @@ import struct
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 import numpy as np
 import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 
 sys.path.insert(0, str(Path(__file__).parent))
 from neuron_engine import HostAssets, NeuronTTSEngine, Sampling  # noqa: E402
@@ -48,6 +49,7 @@ class EngineWorker:
         self.engine = engine
         self.cv = threading.Condition()
         self.load = 0
+        self.gaps = deque(maxlen=4000)        # ms between the end of one step and the start of the next (busy only)
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
@@ -65,12 +67,34 @@ class EngineWorker:
     def _run(self):
         # NOTE: no torch.set_num_threads here. Dynamo guards on that global: changing it in the serving thread made
         # every compiled graph recompile on its first serving step (2.5 s stall for all streams in flight).
+        t_end = None
         while True:
             with self.cv:
                 while not self.engine.waiting and not self.engine.active():
                     self.cv.wait()
+                    t_end = None
+            t0 = time.perf_counter()
+            if t_end is not None:
+                self.gaps.append((t0 - t_end) * 1e3)
             with torch.no_grad():
                 self.engine.step()
+            t_end = time.perf_counter()
+
+
+def phase_summary(recs):
+    """Mean ms per step for each phase over the recent steps (host wall time, no device sync: device work shows up in
+    the phase that first blocks on it). Mean, not median, is what sets throughput."""
+    recs = list(recs)
+    if not recs:
+        return {}
+    phases = {}
+    for _, _, ph in recs:
+        for k, v in ph.items():
+            phases[k] = phases.get(k, 0.0) + v / len(recs)
+    step_mean = float(np.mean([r[0] for r in recs]))
+    out = {"step_mean": step_mean, "prefill_steps_pct": 100.0 * np.mean([r[1] > 0 for r in recs]), **phases,
+           "unaccounted": step_mean - sum(phases.values())}
+    return {k: round(float(v), 2) for k, v in out.items()}
 
 
 def build_app(workers):
@@ -94,7 +118,8 @@ def build_app(workers):
             ms = np.array(w.engine.stats["step_ms"][-2000:] or [0.0])
             out.append({"steps": w.engine.stats["steps"], "step_ms_p50": float(np.median(ms)),
                         "step_ms_p90": float(np.percentile(ms, 90)), "active": len(w.engine.active()),
-                        "waiting": len(w.engine.waiting)})
+                        "waiting": len(w.engine.waiting), "phases": phase_summary(w.engine.stats["phases"]),
+                        "gap_ms_mean": round(float(np.mean(w.gaps or [0.0])), 2)})
         return out
 
     @app.post("/v1/audio/speech")
@@ -159,12 +184,14 @@ def main():
     ap.add_argument("--slots", type=int, default=32)
     ap.add_argument("--codec-every", type=int, default=1)
     ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--seed", type=int, default=1234)
     a = ap.parse_args()
     torch._dynamo.config.automatic_dynamic_shapes = False
     torch.set_num_threads(1)            # once, BEFORE warm-up: warm-up and serving must see the same global state
     assets = HostAssets(MODEL)
     engines = [NeuronTTSEngine(slots=a.slots, device=f"neuron:{i}", codec_every=a.codec_every, assets=assets,
-                               seed=1234 + i) for i in range(a.cores)]
+                               seed=a.seed + i) for i in range(a.cores)]
+    assets.release_device_copies()
     del assets
     # warm up one engine at a time: NKI kernel tracing is not thread-safe (concurrent traces fail with
     # "No backend set" / "duplicate op name"); afterwards every shape is cached and serving does not trace.

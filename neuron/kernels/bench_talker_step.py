@@ -13,13 +13,16 @@ sys.path.insert(0, str(Path(__file__).parents[1] / "proto"))
 from cp_graph import MODEL  # noqa: E402
 from nari_qwen3_tts.config import ModelAssetConfig  # noqa: E402
 from nari_qwen3_tts.model.checkpoint import CheckpointLoader  # noqa: E402
-from talker_kernels import PAGE, build_group_metadata, kv_write_indices, rope_tables, talker_params, talker_step  # noqa: E402
+from talker_kernels import PAGE, build_group_metadata, kv_write_indices, packed_prefill_mask, rope_tables, talker_params, talker_step  # noqa: E402
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--decode", type=int, default=32)
     ap.add_argument("--prefill", type=int, default=64)
+    ap.add_argument("--packed-tiles", type=int, default=0, help="packed fresh prompts of --prefill tokens in N 128-token tiles")
+    ap.add_argument("--prefill-pps", type=int, default=0, help="pages per prefill segment (0: same as decode)")
+    ap.add_argument("--prefill-segs", type=int, default=1, help="prefill segments of --prefill tokens each (fresh prompts)")
     ap.add_argument("--max-ctx", type=int, default=512)
     ap.add_argument("--iters", type=int, default=10)
     ap.add_argument("--fixed-ctx", action="store_true", help="every decode stream at max_ctx - 1 (like the compiled baseline)")
@@ -37,7 +40,7 @@ def main():
     del talker
 
     pps = (a.max_ctx + PAGE - 1) // PAGE
-    nblk = (a.decode + 1) * pps
+    nblk = (a.decode + a.prefill_segs) * pps + 1 + a.packed_tiles * 8
     perm = torch.randperm(nblk).tolist()
     ctxs = [a.max_ctx - 1] * a.decode if a.fixed_ctx else [int(c) for c in torch.randint(1, a.max_ctx - 1, (a.decode,))]
     dec = []
@@ -46,13 +49,32 @@ def main():
         blocks = [perm.pop() for _ in range((c + 1 + PAGE - 1) // PAGE)]
         dec.append((blocks, c, 1)); wblk.append(blocks[c // PAGE]); woff.append(c % PAGE); pos.append(c)
     groups, metas = [(a.decode, 1, pps)], list(build_group_metadata(dec, 1, pps, nblk * L))
-    if a.prefill:
-        pctx = max(0, a.max_ctx - a.prefill - 1) // 2
-        blocks = [perm.pop() for _ in range((pctx + a.prefill + PAGE - 1) // PAGE)]
-        groups.append((1, a.prefill, pps))
-        metas += list(build_group_metadata([(blocks, pctx, a.prefill)], a.prefill, pps, nblk * L))
-        for t in range(pctx, pctx + a.prefill):
-            wblk.append(blocks[t // PAGE]); woff.append(t % PAGE); pos.append(t)
+    if a.packed_tiles:
+        per = PAGE // a.prefill                       # prompts per tile
+        seg = []
+        for t in range(a.packed_tiles):
+            for j in range(per):
+                blocks = [perm.pop()]
+                for i in range(a.prefill):
+                    wblk.append(blocks[0]); woff.append(i); pos.append(i)
+                seg += [t * per + j] * a.prefill
+            pad = PAGE - per * a.prefill
+            wblk += [-1] * pad; woff += [0] * pad; pos += [0] * pad; seg += [-1] * pad
+        groups.append((a.packed_tiles, PAGE, 0))
+        metas += [None, packed_prefill_mask(seg)]
+        print(f"packed: {a.packed_tiles} tiles x {per} prompts of {a.prefill} tokens")
+    elif a.prefill:
+        nps = a.prefill_segs
+        pctx = max(0, a.max_ctx - a.prefill - 1) // 2 if nps == 1 else 0
+        segs = []
+        for _ in range(nps):
+            blocks = [perm.pop() for _ in range((pctx + a.prefill + PAGE - 1) // PAGE)]
+            segs.append((blocks, pctx, a.prefill))
+            for t in range(pctx, pctx + a.prefill):
+                wblk.append(blocks[t // PAGE]); woff.append(t % PAGE); pos.append(t)
+        ppp = a.prefill_pps or pps
+        groups.append((nps, a.prefill, ppp))
+        metas += list(build_group_metadata(segs, a.prefill, ppp, nblk * L))
     T = len(pos)
     rows = kv_write_indices(wblk, woff, nblk * L)
     cos, sin = rope_tables(torch.tensor(pos), theta)
@@ -63,8 +85,8 @@ def main():
     x = (torch.randn(2048, T) * 0.05).to(torch.bfloat16).to("neuron")
     kwargs = dict(k_cache=kc, v_cache=vc, rows_hbm=dev(rows), offs0=dev(metas[0]), mask0=dev(metas[1]),
                   groups=tuple(groups), eps=eps, do_kv_write=not a.no_kv_write, do_attention=not a.no_attention)
-    if a.prefill:
-        kwargs.update(offs1=dev(metas[2]), mask1=dev(metas[3]))
+    if len(groups) > 1:
+        kwargs.update(offs1=None if metas[2] is None else dev(metas[2]), mask1=dev(metas[3]))
     t0 = time.perf_counter()
     talker_step(x, dev(cos), dev(sin), **d, **kwargs)
     torch.neuron.synchronize()

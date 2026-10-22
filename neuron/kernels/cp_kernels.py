@@ -149,34 +149,16 @@ def _add_residual(x, y, KT, B):
     return out
 
 
-@nki.jit
-def cp_step(xT, kv, ln1, qkv, o, ln2, gate_up, down, final_norm, lm_head, rope, s: int, eps: float,
-            with_head: bool = True, qkv_s=None, o_s=None, gate_up_s=None, down_s=None, lm_head_s=None):
-    """One Code Predictor depth step for B rows.
-
-    xT [1024, B] bf16 (projected input embedding, transposed); kv [L, 2, 128, 16, 8, B] bf16 cache,
-    slot ``s`` is written in place; per-layer weights stacked on dim 0 (see ``cp_step_params``);
-    lm_head = tiled head for this step's group; rope [L, 2, 128, 128] = this step's matrices.
-    A weight whose ``*_s`` scale is given is uint8 legacy-e4m3 FP8 (``cp_step_params(fp8=...)``).
-    Returns logitsT [2048, B] fp32 (if with_head) and the final hidden [1024, B] bf16 (pre-norm).
-    """
+def _cp_layers(x, kv, ln1, qkv, o, ln2, gate_up, down, rope, s, eps, ones_f32, ones_bf, qkv_s=None, o_s=None,
+               gate_up_s=None, down_s=None):
+    """All Code Predictor layers for depth step ``s`` (static): x [P, KT, B] bf16 -> x; K/V slot s written to kv."""
     sc_ = lambda t, l=None: None if t is None else (t if l is None else t[l])  # noqa: E731
-    H, B = xT.shape
+    KT, B = x.shape[1], x.shape[2]
     L = kv.shape[0]
     KVH = kv.shape[4]
     NH = 16
-    KT = H // P
     J = s + 1
     group = NH // KVH
-
-    ones_f32 = nl.ndarray((P, P), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.memset(dst=ones_f32, value=1.0)
-    ones_bf = nl.ndarray((P, P), dtype=nl.bfloat16, buffer=nl.sbuf)
-    nisa.memset(dst=ones_bf, value=1.0)
-
-    x = nl.ndarray((P, KT, B), dtype=nl.bfloat16, buffer=nl.sbuf)
-    nisa.dma_copy(dst=x, src=xT.reshape((KT, P, B)).permute((1, 0, 2)))
-
     for l in nl.static_range(L):
         # ---- attention
         hn = _rmsnorm(x, ln1[l], KT, B, eps, ones_f32)
@@ -259,13 +241,203 @@ def cp_step(xT, kv, ln1, qkv, o, ln2, gate_up, down, final_norm, lm_head, rope, 
         mlp_out = _linear(hmid, I_T, down[l], B, nl.bfloat16, sc_(down_s, l))      # [P, 8, B]
         x = _add_residual(x, mlp_out, KT, B)
 
+    return x
+
+
+@nki.jit
+def cp_step(xT, kv, ln1, qkv, o, ln2, gate_up, down, final_norm, lm_head, rope, s: int, eps: float,
+            with_head: bool = True, qkv_s=None, o_s=None, gate_up_s=None, down_s=None, lm_head_s=None):
+    """One Code Predictor depth step for B rows.
+
+    xT [1024, B] bf16 (projected input embedding, transposed); kv [L, 2, 128, 16, 8, B] bf16 cache,
+    slot ``s`` is written in place; per-layer weights stacked on dim 0 (see ``cp_step_params``);
+    lm_head = tiled head for this step's group; rope [L, 2, 128, 128] = this step's matrices.
+    A weight whose ``*_s`` scale is given is uint8 legacy-e4m3 FP8 (``cp_step_params(fp8=...)``).
+    Returns logitsT [2048, B] fp32 (if with_head) and the final hidden [1024, B] bf16 (pre-norm).
+    """
+    H, B = xT.shape
+    KT = H // P
+
+    ones_f32 = nl.ndarray((P, P), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.memset(dst=ones_f32, value=1.0)
+    ones_bf = nl.ndarray((P, P), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.memset(dst=ones_bf, value=1.0)
+
+    x = nl.ndarray((P, KT, B), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.dma_copy(dst=x, src=xT.reshape((KT, P, B)).permute((1, 0, 2)))
+
+    x = _cp_layers(x, kv, ln1, qkv, o, ln2, gate_up, down, rope, s, eps, ones_f32, ones_bf, qkv_s, o_s, gate_up_s,
+                   down_s)
+
     hidden = nl.ndarray((H, B), dtype=nl.bfloat16, buffer=nl.shared_hbm)
     nisa.dma_copy(dst=hidden.reshape((KT, P, B)).permute((1, 0, 2)), src=x)
     if not with_head:
         return hidden
     xf = _rmsnorm(x, final_norm, KT, B, eps, ones_f32)
-    logits = _linear(xf, KT, lm_head, B, nl.float32, sc_(lm_head_s))               # [P, 16, B]
+    logits = _linear(xf, KT, lm_head, B, nl.float32, lm_head_s)                    # [P, 16, B]
     NV = logits.shape[1]
     logitsT = nl.ndarray((NV * P, B), dtype=nl.float32, buffer=nl.shared_hbm)
     nisa.dma_copy(dst=logitsT.reshape((NV, P, B)).permute((1, 0, 2)), src=logits)
     return logitsT, hidden
+
+
+# ------------------------------------------------------------------------------------ whole frame (16 depth steps)
+TOPK = 50
+NEG_BIG = -1.0e30
+
+
+def _head_rows(xf, lm_head, B):
+    """xf [P, KT, B] bf16 x tiled lm_head -> logits [B, V] fp32 with ROWS on partitions (x is the stationary operand,
+    weight blocks stream as moving: no transposes for the row-wise sampling that follows)."""
+    KT = xf.shape[1]
+    NB = lm_head.shape[0]
+    lg = nl.ndarray((B, NB * N_BLOCK), dtype=nl.float32, buffer=nl.sbuf)
+    for nb in nl.static_range(NB):
+        w_blk = nl.ndarray((P, KT, N_BLOCK), dtype=lm_head.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=w_blk, src=lm_head[nb])
+        for j in nl.static_range(N_BLOCK // 512):
+            acc = nl.ndarray((B, 512), dtype=nl.float32, buffer=nl.psum)
+            for k in nl.static_range(KT):
+                nisa.nc_matmul(dst=acc, stationary=xf[:, k, :], moving=w_blk[:, k, j * 512:(j + 1) * 512],
+                               accumulate=(k > 0))
+            c0 = nb * N_BLOCK + j * 512
+            nisa.tensor_copy(dst=lg[:, c0:c0 + 512], src=acc)
+    return lg
+
+
+def _sample_rows(lg, u, inv_t, greedy, iota_k, ident_f, tri):
+    """Row-wise top-k (k=TOPK) sampling, same algorithm as ``_DeviceSampler``: softmax(top-k * inv_t), inverse CDF at
+    u * total, argmax for greedy rows. lg [B, V] fp32; u / inv_t / greedy [B, 1] fp32 -> token [B, 1] fp32.
+    Top-k by 7 rounds of max8 + match_replace8 (56 sorted candidates, the first 50 used)."""
+    B = lg.shape[0]
+    R8 = (TOPK + 7) // 8
+    vals = nl.ndarray((B, R8 * 8), dtype=nl.float32, buffer=nl.sbuf)
+    idx = nl.ndarray((B, R8 * 8), dtype=nl.uint32, buffer=nl.sbuf)
+    # (match_replace8 with dst_idx is unimplemented on gen2: indices come from find_index8 on an untouched copy)
+    work = nl.ndarray(lg.shape, dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=work, src=lg)
+    for r in nl.static_range(R8):
+        nisa.max8(dst=vals[:, r * 8:(r + 1) * 8], src=work)
+        nisa.nc_find_index8(dst=idx[:, r * 8:(r + 1) * 8], data=lg, vals=vals[:, r * 8:(r + 1) * 8])
+        if r < R8 - 1:
+            nisa.nc_match_replace8(dst=work, data=work, vals=vals[:, r * 8:(r + 1) * 8], imm=NEG_BIG)
+    e = nl.ndarray((B, TOPK), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=e, data=vals[:, 0:TOPK], op0=nl.subtract, operand0=vals[:, 0:1], op1=nl.multiply,
+                       operand1=inv_t)
+    nisa.activation(dst=e, op=nl.exp, data=e)
+    # cumsum along the free axis as two small PE matmuls (tensor_scalar_cumulative fails to lower on gen2 here):
+    # eT = transpose(e), cdf = eT^T @ tri with tri[k, j] = (k <= j)
+    eT_ps = nl.ndarray((TOPK, B), dtype=nl.float32, buffer=nl.psum)
+    nisa.nc_matmul(dst=eT_ps, stationary=e, moving=ident_f[0:B, 0:B])
+    eT = nl.ndarray((TOPK, B), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=eT, src=eT_ps)
+    cdf_ps = nl.ndarray((B, TOPK), dtype=nl.float32, buffer=nl.psum)
+    nisa.nc_matmul(dst=cdf_ps, stationary=eT, moving=tri)
+    cdf = nl.ndarray((B, TOPK), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=cdf, src=cdf_ps)
+    thr = nl.ndarray((B, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=thr, data1=u, data2=cdf[:, TOPK - 1:TOPK], op=nl.multiply)
+    lt = nl.ndarray((B, TOPK), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=lt, data=cdf, op0=nl.less, operand0=thr)
+    pick = nl.ndarray((B, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_reduce(dst=pick, op=nl.add, data=lt, axis=1)
+    nisa.tensor_scalar(dst=pick, data=pick, op0=nl.minimum, operand0=float(TOPK - 1))
+    oh = nl.ndarray((B, TOPK), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=oh, data=iota_k, op0=nl.equal, operand0=pick)
+    idx_f = nl.ndarray((B, TOPK), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=idx_f, src=idx[:, 0:TOPK])
+    sel = nl.ndarray((B, TOPK), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=sel, data1=oh, data2=idx_f, op=nl.multiply)
+    tok = nl.ndarray((B, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_reduce(dst=tok, op=nl.add, data=sel, axis=1)
+    # greedy rows: tok += greedy * (argmax - tok)
+    dg = nl.ndarray((B, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=dg, data1=idx_f[:, 0:1], data2=tok, op=nl.subtract)
+    nisa.tensor_tensor(dst=dg, data1=dg, data2=greedy, op=nl.multiply)
+    nisa.tensor_tensor(dst=tok, data1=tok, data2=dg, op=nl.add)
+    return tok
+
+
+def _sample_consts(B):
+    """iota_k [B, TOPK] = 0..TOPK-1; ident_f [P, P] fp32 identity; tri [TOPK, TOPK] fp32 with tri[k, j] = (k <= j)."""
+    ii = nl.ndarray((B, TOPK), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.iota(dst=ii, pattern=[[1, TOPK]], offset=0, channel_multiplier=0)
+    iota_k = nl.ndarray((B, TOPK), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=iota_k, src=ii)
+    di = nl.ndarray((P, P), dtype=nl.int32, buffer=nl.sbuf)                     # j - k
+    nisa.iota(dst=di, pattern=[[1, P]], offset=0, channel_multiplier=-1)
+    df = nl.ndarray((P, P), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=df, src=di)
+    ident_f = nl.ndarray((P, P), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=ident_f, data=df, op0=nl.equal, operand0=0.0)
+    tri = nl.ndarray((TOPK, TOPK), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=tri, data=df[0:TOPK, 0:TOPK], op0=nl.greater_equal, operand0=0.0)
+    return iota_k, ident_f, tri
+
+
+def _embed_t(table_rows, tok_f, row_offset, ident_bf, KT, B):
+    """Next depth input: rows ``table_rows[tok + row_offset]`` gathered by one indirect DMA (rows on partitions), then
+    PE-transposed to the [P, KT, B] feature-major layout."""
+    D = KT * P
+    ti = nl.ndarray((B, 1), dtype=nl.int32, buffer=nl.sbuf)
+    if row_offset:
+        tf = nl.ndarray((B, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=tf, data=tok_f, op0=nl.add, operand0=float(row_offset))
+        nisa.tensor_copy(dst=ti, src=tf)
+    else:
+        nisa.tensor_copy(dst=ti, src=tok_f)
+    emb = nl.ndarray((B, D), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.dma_copy(dst=emb, src=table_rows.ap(pattern=[[D, B], [1, D]], offset=0, vector_offset=ti, indirect_dim=0))
+    x = nl.ndarray((P, KT, B), dtype=nl.bfloat16, buffer=nl.sbuf)
+    for k in nl.static_range(KT):
+        tp = nl.ndarray((P, B), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_matmul(dst=tp, stationary=emb[:, k * P:(k + 1) * P], moving=ident_bf[0:B, 0:B])
+        nisa.tensor_copy(dst=x[:, k, :], src=tp)
+    return x
+
+
+@nki.jit
+def cp_frame(xT, tok0, kv, ln1, qkv, o, ln2, gate_up, down, final_norm, lm_heads, rope, proj_l0, proj_res, u, inv_t,
+             greedy, ident, eps: float):
+    """One whole Code Predictor frame (16 depth steps + on-chip sampling + next-input lookups) in ONE launch.
+
+    xT [1024, B] bf16 = small_proj(talker hidden); tok0 [B, 1] fp32 = talker token; kv [L, 2, 128, 16, 8, B] cache;
+    lm_heads [15, ...] tiled; rope [16, L, 2, 128, 128]; proj_l0 [3072, 1024] and proj_res [14*2048, 1024] bf16 input
+    tables; u [B, 15] fp32 host uniforms; inv_t / greedy [B, 1] fp32; ident [128, 128] bf16.
+    Returns tokens [B, 15] fp32 for depth groups 1..15 (exact integers).
+    """
+    H, B = xT.shape
+    KT = H // P
+    V = lm_heads.shape[1] * N_BLOCK
+    ones_f32 = nl.ndarray((P, P), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.memset(dst=ones_f32, value=1.0)
+    ones_bf = nl.ndarray((P, P), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.memset(dst=ones_bf, value=1.0)
+    ident_bf = nl.ndarray((P, P), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.dma_copy(dst=ident_bf, src=ident)
+    iota_k, ident_f, tri = _sample_consts(B)
+    u_sb = nl.ndarray((B, 15), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=u_sb, src=u)
+    it_sb = nl.ndarray((B, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=it_sb, src=inv_t)
+    gr_sb = nl.ndarray((B, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=gr_sb, src=greedy)
+    t0 = nl.ndarray((B, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=t0, src=tok0)
+    toks = nl.ndarray((B, 15), dtype=nl.float32, buffer=nl.sbuf)
+
+    x = nl.ndarray((P, KT, B), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.dma_copy(dst=x, src=xT.reshape((KT, P, B)).permute((1, 0, 2)))
+    x = _cp_layers(x, kv, ln1, qkv, o, ln2, gate_up, down, rope[0], 0, eps, ones_f32, ones_bf)
+    x = _embed_t(proj_l0, t0, 0, ident_bf, KT, B)                     # step-0 output is only its K/V
+    for st in nl.static_range(1, 16):
+        x = _cp_layers(x, kv, ln1, qkv, o, ln2, gate_up, down, rope[st], st, eps, ones_f32, ones_bf)
+        xf = _rmsnorm(x, final_norm, KT, B, eps, ones_f32)
+        lg = _head_rows(xf, lm_heads[st - 1], B)
+        tok = _sample_rows(lg, u_sb[:, st - 1:st], it_sb, gr_sb, iota_k, ident_f, tri)
+        nisa.tensor_copy(dst=toks[:, st - 1:st], src=tok)
+        if st < 15:
+            x = _embed_t(proj_res, tok, (st - 1) * (V), ident_bf, KT, B)
+    out = nl.ndarray((B, 15), dtype=nl.float32, buffer=nl.shared_hbm)
+    nisa.dma_copy(dst=out, src=toks)
+    return out

@@ -101,7 +101,7 @@ def main():
                 v_cache[l, b, o] = V[t]
 
     # this step's tokens: one decode token per sequence, then the prefill chunk
-    xs, pos, wblk, woff, refs = [], [], [], [], []
+    xs, pos, wblk, woff = [], [], [], []
     for i, c in enumerate(seqs):
         xs.append(emb[torch.randint(0, emb.shape[0], (1,))]); pos.append(torch.tensor([c]))
         wblk.append(blocks[i][c // PAGE]); woff.append(c % PAGE)

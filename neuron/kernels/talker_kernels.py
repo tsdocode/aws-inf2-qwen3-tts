@@ -16,7 +16,7 @@ import nki.isa as nisa
 import nki.language as nl
 import torch
 
-from cp_kernels import _add_residual, _linear, _rmsnorm
+from cp_kernels import _add_residual
 from decode_linear import N_BLOCK
 from decode_linear import P, tile_weight
 
@@ -252,23 +252,33 @@ def build_group_metadata(seqs, qps, pps, num_blocks):
     elements fits int32, or it wraps back in bounds.)
     """
     nseg = len(seqs)
-    offs = torch.zeros(1, nseg * pps, dtype=torch.int32)
-    mask = torch.full((PAGE, nseg, pps, qps), MASK_NEG)
-    lane = torch.arange(PAGE)
-    for s, (blocks, ctx, nq) in enumerate(seqs):
-        for i in range(pps):
-            offs[0, s * pps + i] = blocks[i] if i < len(blocks) else num_blocks
-        for j in range(nq):
-            qpos = ctx + j
-            key_pos = torch.arange(pps).unsqueeze(0) * PAGE + lane.unsqueeze(1)          # [128, pps]
-            mask[:, s, :, j] = torch.where(key_pos <= qpos, 0.0, MASK_NEG)
+    offs = torch.tensor([[(blocks[i] if i < len(blocks) else num_blocks) for blocks, _, _ in seqs for i in range(pps)]],
+                        dtype=torch.int32)
+    # query j of segment s sits at ctx + j; queries j >= nq are padding (position -1: no visible key)
+    j = torch.arange(qps)
+    ctx = torch.tensor([c for _, c, _ in seqs]).unsqueeze(1)
+    nq = torch.tensor([n for _, _, n in seqs]).unsqueeze(1)
+    qpos = torch.where(j < nq, ctx + j, -1)                                                  # [nseg, qps]
+    key_pos = torch.arange(pps).unsqueeze(0) * PAGE + torch.arange(PAGE).unsqueeze(1)        # [128, pps]
+    ok = key_pos.view(PAGE, 1, pps, 1) <= qpos.view(1, nseg, 1, qps)
+    mask = torch.where(ok, 0.0, MASK_NEG).float().contiguous()
     return offs, mask
+
+
+def packed_prefill_mask(seg_ids):
+    """seg_ids [nch*128] int (segment of each packed token, -1 = padding; a segment's tokens are contiguous, in
+    position order, and never straddle a 128-token tile) -> additive mask [128 queries, nch, 128 keys] fp32 for
+    ``_attend_packed``: key visible iff same segment and not after the query."""
+    sid = torch.as_tensor(seg_ids).view(-1, PAGE)                                   # [nch, 128]
+    i = torch.arange(PAGE)
+    ok = (sid.unsqueeze(2) == sid.unsqueeze(1)) & (sid.unsqueeze(2) >= 0) & (i.view(1, 1, -1) <= i.view(1, -1, 1))
+    return torch.where(ok, 0.0, MASK_NEG).permute(1, 0, 2).float().contiguous()     # [q, nch, k]
 
 
 def _attend_group(q, att, tok0, nseg, qps, pps, offs_hbm, mask_hbm, k_pages, v_pages, ones_bf, ident_f32, seg_chunk,
                   dbg=None, ident_bf=None, tag=None):
     """Paged attention for one static group, writes att[:, h, tok0 + s*qps + j] (bf16, [D, NH, T] layout)."""
-    NH, KVH = 16, 8
+    KVH = 8
     lanes = 2 * qps                                            # 2 query heads per KV head x query tokens
     scale = 1.0 / (HEAD_DIM ** 0.5)
     seg_chunk = max(1, min(seg_chunk, P // lanes))             # the max transpose takes <= 128 lanes per chunk
@@ -377,6 +387,54 @@ def _attend_group(q, att, tok0, nseg, qps, pps, offs_hbm, mask_hbm, k_pages, v_p
                                    op=nl.multiply)
 
 
+def _attend_packed(q, k, v, att, tok0, nch, mask, ident_bf):
+    """Causal attention for fresh prompts packed back to back in ``nch`` tiles of 128 tokens (varlen prefill).
+
+    Fresh prompts have no earlier context, so every key is one of this step's tokens: attention runs on q/k/v straight
+    from SBUF (no page reads, no K transposes). mask [P queries, nch, P keys] fp32 additive, block-diagonal causal
+    (``packed_prefill_mask``); tokens [tok0, tok0 + nch*128). Queries sit on partitions (softmax along the free axis),
+    HG=4 heads per pass: every vector op is [128, 4*128] wide and the matmuls fill one PSUM bank, so the per-head
+    chain of small dependent instructions (latency-bound: ~12 ms for 4 tiles) is 4x shorter.
+    """
+    NH, HG = 16, 4
+    scale = 1.0 / (HEAD_DIM ** 0.5)
+    for c in nl.static_range(nch):
+        t0 = tok0 + c * P
+        for h0 in nl.static_range(0, NH, HG):
+            g0 = h0 // 2                                                         # 2 KV heads per pass
+            vt_ps = nl.ndarray((P, 2, P), dtype=nl.float32, buffer=nl.psum)      # V^T: [keys, kv head, d]
+            for gg in nl.static_range(2):
+                nisa.nc_matmul(dst=vt_ps[:, gg, :], stationary=v[:, g0 + gg, t0:t0 + P], moving=ident_bf)
+            vt = nl.ndarray((P, 2, P), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.activation(dst=vt, op=nl.copy, data=vt_ps)
+            s_ps = nl.ndarray((P, HG, P), dtype=nl.float32, buffer=nl.psum)      # [queries, head, keys]
+            for hh in nl.static_range(HG):
+                h = h0 + hh
+                nisa.nc_matmul(dst=s_ps[:, hh, :], stationary=q[:, h, t0:t0 + P], moving=k[:, h // 2, t0:t0 + P])
+            sc = nl.ndarray((P, HG, P), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=sc, data1=s_ps, data2=mask[:, c:c + 1, :].broadcast(1, HG), op=nl.add)
+            mx = nl.ndarray((P, HG), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_reduce(dst=mx, op=nl.maximum, data=sc, axis=2)
+            nisa.tensor_tensor(dst=sc, data1=sc, data2=mx.expand_dim(2).broadcast(2, P), op=nl.subtract)
+            e = nl.ndarray((P, HG, P), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.activation(dst=e, op=nl.exp, data=sc, scale=scale)
+            den = nl.ndarray((P, HG), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_reduce(dst=den, op=nl.add, data=e, axis=2)
+            rden = nl.ndarray((P, HG), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.reciprocal(dst=rden, data=den)
+            pn = nl.ndarray((P, HG, P), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=pn, data1=e, data2=rden.expand_dim(2).broadcast(2, P), op=nl.multiply)
+            pt_ps = nl.ndarray((P, HG, P), dtype=nl.float32, buffer=nl.psum)     # P^T: [keys, head, queries]
+            for hh in nl.static_range(HG):
+                nisa.nc_matmul(dst=pt_ps[:, hh, :], stationary=pn[:, hh, :], moving=ident_bf)
+            pt = nl.ndarray((P, HG, P), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=pt, src=pt_ps)
+            o_ps = nl.ndarray((P, HG, P), dtype=nl.float32, buffer=nl.psum)      # [d, head, queries]
+            for hh in nl.static_range(HG):
+                nisa.nc_matmul(dst=o_ps[:, hh, :], stationary=vt[:, hh // 2, :], moving=pt[:, hh, :])
+            nisa.activation(dst=att[:, h0:h0 + HG, t0:t0 + P], op=nl.copy, data=o_ps)
+
+
 @nki.jit
 def paged_attention(q_hbm, k_cache, v_cache, offs0, mask0, offs1=None, mask1=None, groups=(), seg_chunk: int = 4,
                     debug: bool = False):
@@ -465,7 +523,8 @@ def talker_step(xT, cos_hbm, sin_hbm, ln1, qkv, qn_w, kn_w, q_rot, k_rot, o, ln2
 
     xT [2048, T] bf16 input embeddings (tokens ordered group by group, segment by segment); cos/sin [128, T];
     k_cache / v_cache [L, NBLK, PAGE, KVH, D] bf16 (token-major), updated in place with this step's K/V (rows from
-    ``kv_write_indices``); groups + offs/mask from ``build_group_metadata``.
+    ``kv_write_indices``); groups + offs/mask from ``build_group_metadata``. A group with pps == 0 is
+    (n_tiles, 128, 0): fresh prompts packed into 128-token tiles, its mask from ``packed_prefill_mask`` (offs unused).
     Returns the final-normed hidden [2048, T] bf16.
     """
     H, T = xT.shape
@@ -488,6 +547,12 @@ def talker_step(xT, cos_hbm, sin_hbm, ln1, qkv, qn_w, kn_w, q_rot, k_rot, o, ln2
     x = nl.ndarray((P, KT, T), dtype=nl.bfloat16, buffer=nl.sbuf)
     nisa.dma_copy(dst=x, src=xT.reshape((KT, P, T)).permute((1, 0, 2)))
     meta = ((offs0, mask0), (offs1, mask1))
+    packed_mask = {}                                       # group index -> SBUF mask, loaded once for all layers
+    for gi, (nseg, qps, pps) in enumerate(groups):
+        if pps == 0:
+            pm = nl.ndarray((P, nseg, P), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=pm, src=meta[gi][1])
+            packed_mask[gi] = pm
 
     for l in nl.static_range(L):
         hn = _rmsnorm_tc(x, ln1[l], KT, T, eps, ones_f32)
@@ -507,8 +572,11 @@ def talker_step(xT, cos_hbm, sin_hbm, ln1, qkv, qn_w, kn_w, q_rot, k_rot, o, ln2
         v_pages = v_cache[l].reshape((NBLK, PAGE * KVH * HEAD_DIM))
         tok0 = 0
         for gi, (nseg, qps, pps) in enumerate(groups if do_attention else ()):
-            _attend_group(q, att, tok0, nseg, qps, pps, meta[gi][0], meta[gi][1], k_pages, v_pages, ones_bf, ident_f32,
-                          seg_chunk, ident_bf=ident_bf, tag=f"{l}_{gi}")
+            if pps == 0:                                    # packed fresh prompts (varlen prefill)
+                _attend_packed(q, k, v, att, tok0, nseg, packed_mask[gi], ident_bf)
+            else:
+                _attend_group(q, att, tok0, nseg, qps, pps, meta[gi][0], meta[gi][1], k_pages, v_pages, ones_bf,
+                              ident_f32, seg_chunk, ident_bf=ident_bf, tag=f"{l}_{gi}")
             tok0 += nseg * qps
         attn_out = _linear_tc(att, NH, o[l], T, nl.bfloat16)
         x = _add_residual(x, attn_out, KT, T)

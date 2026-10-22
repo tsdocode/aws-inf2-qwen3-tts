@@ -8,3 +8,5 @@ __pycache__/
 neuron/profiles/**/*.ntff
 neuron/profiles/**/*.neff
 neuron/profiles/**/*.log
+neuron/golden/*.neuron.wav
+neuron/profiles/

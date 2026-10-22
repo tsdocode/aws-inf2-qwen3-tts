@@ -42,7 +42,7 @@ def main():
     torch.neuron.synchronize()
     t0 = time.perf_counter()
     for _ in range(a.iters):
-        out = neu(x)
+        neu(x)
     torch.neuron.synchronize()
     ms = (time.perf_counter() - t0) / a.iters * 1e3
     print(f"B={a.rows} T={a.frames}: {ms:.1f} ms per chunk (wall, all launches) = {ms / a.frames:.2f} ms per frame-batch "

@@ -9,6 +9,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parents[1] / "proto"))
 from codec_kernels import residual_unit, snake_conv_out, snake_transconv  # noqa: E402
+from codec_front_kernels import front_attention_mask, front_rope_tables, front_transformer  # noqa: E402
 from codec_stream import StreamingCodecDecoder  # noqa: E402
 from cp_graph import MODEL  # noqa: E402
 from nari_qwen3_tts.config import ModelAssetConfig  # noqa: E402
@@ -31,14 +32,6 @@ def main():
         torch.neuron.synchronize()
         st = neu.state
         rows, n = [], 10
-        if neu.nki_front:                     # full-chunk timing only (stage breakdown is for the compiled front)
-            t0 = time.perf_counter()
-            for _ in range(n):
-                neu(codes)
-            torch.neuron.synchronize()
-            full = (time.perf_counter() - t0) / n * 1e3
-            print(f"B={a.rows} F={F} (NKI front): full chunk {full:.1f} ms ({full / F:.1f} ms per frame)")
-            continue
 
         def timed(name, fn):
             out = fn()
@@ -50,9 +43,19 @@ def main():
             rows.append((name, (time.perf_counter() - t0) / n * 1e3))
             return out
 
-        o = timed("front (compiled)", lambda: neu.front(codes, st["pos"], st["ctx"], st["pre"], st["tf_k"], st["tf_v"],
-                                                         st["cnx0"], st["cnx1"], st["dec0"]))
-        h = o[0]
+        if neu.nki_front:
+            d = neu.device
+            hT = timed("front pre (compiled)", lambda: neu.pre(codes, st["pre"]))[0]
+            tabs = timed("front host tables + H2D", lambda: [
+                t.to(d) for t in (*front_rope_tables(st["pos"], F, neu.tf_inv_freq),
+                                  front_attention_mask(st["ctx"], F, retained=neu.front_mod.retained,
+                                                       window=neu.front_mod.window))])
+            yT = timed("front transformer (NKI)", lambda: front_transformer(
+                hT, *tabs, st["fk"], st["fv"], **neu.tf_params, eps=neu.tf_eps, qk_norm=neu.tf_qk_norm))[0]
+            h = timed("front post (compiled)", lambda: neu.post(yT, st["cnx0"], st["cnx1"], st["dec0"]))[0]
+        else:
+            h = timed("front (compiled)", lambda: neu.front(codes, st["pos"], st["ctx"], st["pre"], st["tf_k"],
+                                                            st["tf_v"], st["cnx0"], st["cnx1"], st["dec0"]))[0]
         for i, ((tc, tcs, _), units) in enumerate(neu.blocks):
             h = timed(f"block{i} transconv", lambda h=h: snake_transconv(h, **tc, **tcs, hist=st[f"tc{i}"]))[0]
             for j, (prm, sts, _) in enumerate(units):

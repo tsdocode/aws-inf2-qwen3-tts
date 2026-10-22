@@ -10,7 +10,7 @@ block-diagonal ones matmul — which also broadcasts each head's score over its 
 pair are handled at once — softmax along keys on the free axis, then (p (.) V) reduced over keys lands directly in
 the o_proj input layout (V's partitions are the same head dims). No transposes anywhere.
 
-State per layer, row and head pair: K and V as [128 pair dims, 71 slots] (D-major). Keys for a chunk of F frames
+State per layer and head pair: K and V as [128 pair dims, B rows, 71 slots] (D-major, one DMA for all rows). Keys for a chunk of F frames
 are [prior 71 | new F]; the new state is the last 71 columns (static DMA, no runtime offsets).
 Residual stream fp32, matmul operands bf16 with fp32 accumulation.
 """
@@ -151,15 +151,15 @@ def _head_norm_rope(x, n_tiles, N, w_hbm, rot_hbm, cos, sin, eps, blk_ones, qk_n
 
 @nki.jit
 def front_transformer(hT, cos_hbm, sin_hbm, mask_hbm, k_state, v_state, ln1, qkv, qn_w, kn_w, q_rot, k_rot, o,
-                      attn_scale, ln2, gate_up, down, mlp_scale, final_norm, eps: float = 1e-5, row_chunk: int = 4,
+                      attn_scale, ln2, gate_up, down, mlp_scale, final_norm, eps: float = 1e-5, row_chunk: int = 8,
                       qk_norm: bool = False):
     """hT [512, B*F] fp32 (after input_proj) -> (yT [512, B*F] fp32 after final norm, new k_state, new v_state).
 
-    k_state / v_state [L, B, 8, 128, 71] bf16; mask [1, B, F, 71+F] from ``front_attention_mask``;
+    k_state / v_state [L, 8, 128, B, 71] bf16 (pair dims on partitions, all rows side by side); mask [1, B, F, 71+F] from ``front_attention_mask``;
     cos/sin [128, B*F] from ``front_rope_tables``.
     """
     D, N = hT.shape
-    L, B = k_state.shape[0], k_state.shape[1]
+    L, B = k_state.shape[0], k_state.shape[3]
     R = k_state.shape[4]
     F = N // B
     KEYS = R + F
@@ -194,24 +194,33 @@ def front_transformer(hT, cos_hbm, sin_hbm, mask_hbm, k_state, v_state, ln1, qkv
         v = qkv_t[:, 2 * PAIRS:3 * PAIRS, :]
         att = nl.ndarray((P, PAIRS, N), dtype=nl.bfloat16, buffer=nl.sbuf)       # o_proj input (1024 features)
         for p in nl.static_range(PAIRS):
+            # one DMA in / out per (layer, pair) for ALL rows: per-row state DMAs (8k per call) dominated the kernel
+            # (staging copies on ScalarE: VectorE is the busy engine here)
+            # staged through contiguous tiles: a DMA into the strided [:, :, 0:R] view splits into B*128 ~140-byte
+            # descriptors (13 GB/s); contiguous [P, B*R] rows move as one 4.5 KB descriptor per partition
+            kall = nl.ndarray((P, B, KEYS), dtype=nl.bfloat16, buffer=nl.sbuf)
+            vall = nl.ndarray((P, B, KEYS), dtype=nl.bfloat16, buffer=nl.sbuf)
+            kst = nl.ndarray((P, B, R), dtype=nl.bfloat16, buffer=nl.sbuf)
+            vst = nl.ndarray((P, B, R), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.dma_copy(dst=kst, src=k_state[l, p])
+            nisa.dma_copy(dst=vst, src=v_state[l, p])
+            nisa.activation(dst=kall[:, :, 0:R], op=nl.copy, data=kst)
+            nisa.activation(dst=vall[:, :, 0:R], op=nl.copy, data=vst)
+            nisa.tensor_copy(dst=kall[:, :, R:KEYS], src=k[:, p, :].reshape((P, B, F)))
+            nisa.tensor_copy(dst=vall[:, :, R:KEYS], src=v[:, p, :].reshape((P, B, F)))
+            kout = nl.ndarray((P, B, R), dtype=nl.bfloat16, buffer=nl.sbuf)
+            vout = nl.ndarray((P, B, R), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.activation(dst=kout, op=nl.copy, data=kall[:, :, F:KEYS])
+            nisa.activation(dst=vout, op=nl.copy, data=vall[:, :, F:KEYS])
+            nisa.dma_copy(dst=k_new_state[l, p], src=kout)
+            nisa.dma_copy(dst=v_new_state[l, p], src=vout)
             for r0 in nl.static_range(0, B, row_chunk):
                 rc = min(row_chunk, B - r0)
-                kall = nl.ndarray((P, rc, KEYS), dtype=nl.bfloat16, buffer=nl.sbuf)
-                vall = nl.ndarray((P, rc, KEYS), dtype=nl.bfloat16, buffer=nl.sbuf)
-                for i in nl.static_range(rc):
-                    b = r0 + i
-                    nisa.dma_copy(dst=kall[:, i, 0:R], src=k_state[l, b, p])
-                    nisa.dma_copy(dst=vall[:, i, 0:R], src=v_state[l, b, p])
-                    nisa.tensor_copy(dst=kall[:, i, R:KEYS], src=k[:, p, b * F:(b + 1) * F])
-                    nisa.tensor_copy(dst=vall[:, i, R:KEYS], src=v[:, p, b * F:(b + 1) * F])
-                    nisa.dma_copy(dst=k_new_state[l, b, p], src=kall[:, i, F:KEYS])
-                    nisa.dma_copy(dst=v_new_state[l, b, p], src=vall[:, i, F:KEYS])
                 # scores for both heads of the pair: q (.) K, summed per 64-row half (block ones), on the free axis
                 prod = nl.ndarray((P, rc, F, KEYS), dtype=nl.bfloat16, buffer=nl.sbuf)
-                for i in nl.static_range(rc):
-                    b = r0 + i
-                    nisa.tensor_tensor(dst=prod[:, i, :, :], data1=kall[:, i:i + 1, :].broadcast(1, F),
-                                       data2=q[:, p, b * F:(b + 1) * F].expand_dim(2).broadcast(2, KEYS), op=nl.multiply)
+                nisa.tensor_tensor(dst=prod, data1=kall[:, r0:r0 + rc, :].expand_dim(2).broadcast(2, F),
+                                   data2=q[:, p, r0 * F:(r0 + rc) * F].reshape((P, rc, F)).expand_dim(3).broadcast(3, KEYS),
+                                   op=nl.multiply)
                 n = rc * F * KEYS
                 sc = nl.ndarray((P, rc, F, KEYS), dtype=nl.float32, buffer=nl.sbuf)
                 flat_p, flat_s = prod.reshape((P, n)), sc.reshape((P, n))
@@ -231,8 +240,8 @@ def front_transformer(hT, cos_hbm, sin_hbm, mask_hbm, k_state, v_state, ln1, qkv
                 rden = nl.ndarray((P, rc, F), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.reciprocal(dst=rden, data=den)
                 pv = nl.ndarray((P, rc, F, KEYS), dtype=nl.float32, buffer=nl.sbuf)
-                for f in nl.static_range(F):
-                    nisa.tensor_tensor(dst=pv[:, :, f, :], data1=e[:, :, f, :], data2=vall, op=nl.multiply)
+                nisa.tensor_tensor(dst=pv, data1=e, data2=vall[:, r0:r0 + rc, :].expand_dim(2).broadcast(2, F),
+                                   op=nl.multiply)
                 num = nl.ndarray((P, rc, F), dtype=nl.float32, buffer=nl.sbuf)
                 nisa.tensor_reduce(dst=num, op=nl.add, data=pv, axis=3)
                 nisa.tensor_tensor(dst=att[:, p, r0 * F:(r0 + rc) * F], data1=num.reshape((P, rc * F)),

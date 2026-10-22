@@ -1,20 +1,20 @@
 """Lockstep continuous-batching Qwen3-TTS engine on one inf2 NeuronCore (v1).
 
 Every ``step()``:
-  1. ONE fused talker step (kernels/talker_kernels.talker_step): a decode token for each active slot + at most one
-     waiting request's prefill (<= PREFILL_TOKENS tokens) in the same launch (mixed batch, paged KV).
+  1. ONE fused talker step (kernels/talker_kernels.talker_step): a decode token for each active slot (paged KV) +
+     waiting prompts packed back to back into up to 3 tiles of 128 tokens (varlen prefill), in the same launch.
   2. codec_head + talker sampling on host (suppress mask, repetition penalty, temperature, top-k, top-p).
-  3. Code Predictor frame for slots that did not emit EOS: 16 fused step kernels (cp_kernels.cp_step), host
-     top-k sampling between steps (v1; on-device sampling is a TODO).
-  4. ONE streaming codec frame for every slot (codec_stream.StreamingCodecDecoder, batch = slots, F = 1),
-     PCM for active slots is handed to their sinks.
+  3. Code Predictor frame for slots that did not emit EOS: ONE kernel launch (cp_kernels.cp_frame: 16 depth steps,
+     on-chip top-k sampling with host uniforms, next-input lookups). Teacher forcing / non-default sub top-k use the
+     per-step host path (cp_step + host sampling).
+  4. Every ``codec_every`` steps, K streaming codec frames for every slot (codec_stream.StreamingCodecDecoder,
+     batch = slots), PCM for active slots is handed to their sinks.
 Protocol mirrors nari (see engine/prompt.py): EOS blocked for the first 3 sampled tokens, decode input =
 codec_sum(previous frame) + P(trailing text or tts_pad), positions = prefill 0..L-1 then L + t.
 """
 
 import copy
 import json
-import math
 import sys
 import time
 from collections import deque
@@ -29,13 +29,15 @@ sys.path.insert(0, str(HERE.parent / "kernels"))
 sys.path.insert(0, str(HERE.parent / "proto"))
 
 from codec_stream import StreamingCodecDecoder  # noqa: E402
-from cp_kernels import SLOTS as CP_STEPS, cp_step, cp_step_params  # noqa: E402
+from cp_kernels import SLOTS as CP_STEPS, cp_frame, cp_step, cp_step_params  # noqa: E402
 from prompt import CODEC_EOS, TTS_PAD, build_prompt  # noqa: E402
-from talker_kernels import PAGE, build_group_metadata, kv_write_indices, rope_tables, talker_params, talker_step  # noqa: E402
+from talker_kernels import (PAGE, build_group_metadata, kv_write_indices, packed_prefill_mask, rope_tables,  # noqa: E402
+                            talker_params, talker_step)
 
-PREFILL_TOKENS = 64
-PREFILL_SEG_BUCKETS = (1, 4)      # prefill segments per step; 7 (T=480) overflows SBUF in the MLP (needs token-chunked MLP)
-PPS_BUCKETS = (2, 4, 8)            # pages per segment (256 / 512 / 1024 tokens of context)
+PREFILL_TILE_BUCKETS = (1, 2, 3)  # 128-token tiles of packed fresh prompts per step; T = 32 + 3*128 = 416 <= 512: one
+#   token chunk per weight block (T = 544 made every block run a second, 32-token matmul: +11 ms of fixed costs)
+PPS_BUCKETS = (1, 2, 4, 8)         # pages per segment (128 / 256 / 512 / 1024 tokens of context); short utterances
+#   stay under 128 tokens, and every padded page still costs its matmuls
 MAX_CTX = PPS_BUCKETS[-1] * PAGE
 
 
@@ -72,6 +74,7 @@ class Stream:
     t_first_audio: float = None
     t_done: float = None
     audio_frames: int = 0
+    replay: int = 0                                # frames to re-decode from a reset codec row (first-audio path)
     forced: torch.Tensor = None                    # teacher forcing (tests): [n, 16] frames to feed instead of samples
     pred: list = field(default_factory=list)       # teacher forcing: model's own pick per frame [16]
 
@@ -100,6 +103,14 @@ class _DeviceSampler(torch.nn.Module):
 def _sample(logits, temperature, top_k, top_p, greedy, gen):
     if greedy:
         return logits.argmax(-1)
+    if top_k and top_k < logits.shape[-1]:
+        # sample among the top-k only (same distribution as masking the rest to -inf; ~10x cheaper on the host)
+        vals, idx = torch.topk(logits / temperature, top_k, dim=-1)              # sorted descending
+        if top_p < 1.0:
+            p = torch.softmax(vals, -1)
+            vals = vals.masked_fill(p.cumsum(-1) - p > top_p, -torch.inf)
+        pick = torch.multinomial(torch.softmax(vals, -1), 1, generator=gen)
+        return idx.gather(-1, pick).squeeze(-1)
     logits = logits / temperature
     if top_k and top_k < logits.shape[-1]:
         kth = torch.topk(logits, top_k, dim=-1).values[..., -1:]
@@ -144,6 +155,17 @@ class HostAssets:
         self.p_cache = {}
         log(f"host assets loaded in {time.perf_counter() - t0:.0f}s")
 
+    def release_device_copies(self):
+        """After every engine has uploaded its weights: drop the CPU copies only needed for that (tiled talker/CP
+        weights, talker decoder layers, codec module) so one process per NeuronCore fits in host RAM. Keeps the
+        host tables used per step (text embedding + projection, codec/CP embedding tables)."""
+        import gc
+
+        self.talker_params = self.cp_params = None
+        self.talker.model.layers = torch.nn.ModuleList()
+        self.codec = None
+        gc.collect()
+
 
 class NeuronTTSEngine:
     def __init__(self, model_dir=None, slots=32, device="neuron", seed=0, log=print, mix_prefill=True, profile=False,
@@ -166,8 +188,8 @@ class NeuronTTSEngine:
         # ---- small modules: per-engine device copies (``.to(device)`` moves modules in place)
         self.small_proj = copy.deepcopy(A.predictor.small_to_mtp_projection).to(device)
         self.proj_l0_dev = self.proj_l0.to(device)
-        self.proj_res_dev = torch.cat([self.proj_res, torch.zeros_like(self.proj_res[:1])]).contiguous().to(device)
-        self.sampler = torch.compile(_DeviceSampler(50), backend="neuron", fullgraph=True)
+        self.proj_res_rows = self.proj_res.reshape(-1, self.proj_res.shape[-1]).contiguous().to(device)  # [14*2048, 1024]
+        self.ident_dev = torch.eye(128, dtype=torch.bfloat16).to(device)
         self.codec_head = copy.deepcopy(A.talker.codec_head).to(device)
         suppress = torch.zeros(self.cfg["vocab_size"], dtype=torch.bool)
         suppress[2048:] = True
@@ -194,7 +216,7 @@ class NeuronTTSEngine:
 
         self.waiting, self.slots = deque(), [None] * slots
         self.next_rid = 0
-        self.stats = {"steps": 0, "step_ms": []}
+        self.stats = {"steps": 0, "step_ms": [], "phases": deque(maxlen=4000)}
         log(f"engine loaded in {time.perf_counter() - t0:.0f}s ({slots} slots, {self.nblk} KV pages)")
 
     # ------------------------------------------------------------------------------------------------- helpers
@@ -211,8 +233,8 @@ class NeuronTTSEngine:
     def submit(self, text, speaker="ryan", language="auto", instruct="", non_streaming_mode=True, sampling=None,
                sink=None, forced=None):
         prompt = build_prompt(self.tok, self.cfg, text, speaker, language, instruct, non_streaming_mode)
-        if len(prompt.text_ids) > PREFILL_TOKENS:
-            raise ValueError(f"prompt of {len(prompt.text_ids)} tokens > {PREFILL_TOKENS} (chunked prefill TODO)")
+        if len(prompt.text_ids) > PAGE:
+            raise ValueError(f"prompt of {len(prompt.text_ids)} tokens > {PAGE} (chunked prefill TODO)")
         s = Stream(self.next_rid, prompt, sampling or Sampling(), sink, time.perf_counter())
         s.seen = torch.zeros(self.cfg["vocab_size"], dtype=torch.bool)
         s.forced = forced
@@ -236,25 +258,24 @@ class NeuronTTSEngine:
         t0 = time.perf_counter()
         S, d, oob = self.S, self.device, self.nblk * self.L
         for pps in PPS_BUCKETS:
-            for npb in (0,) + PREFILL_SEG_BUCKETS:
-                with_pre = npb > 0
-                T = S + npb * PREFILL_TOKENS
-                groups = [(S, 1, pps)] + ([(npb, PREFILL_TOKENS, pps)] if with_pre else [])
+            for npb in (0,) + PREFILL_TILE_BUCKETS:
+                T = S + npb * PAGE
+                groups = [(S, 1, pps)] + ([(npb, PAGE, 0)] if npb else [])
                 o0, m0 = build_group_metadata([([], -1, 1)] * S, 1, pps, oob)
                 extra = {}
-                if with_pre:
-                    o1, m1 = build_group_metadata([([], 0, 0)] * npb, PREFILL_TOKENS, pps, oob)
-                    extra = dict(offs1=o1.to(d), mask1=m1.to(d))
+                if npb:
+                    extra = dict(offs1=None, mask1=packed_prefill_mask([-1] * (npb * PAGE)).to(d))
                 cos, sin = rope_tables(torch.zeros(T, dtype=torch.long), self.theta)
                 talker_step(torch.zeros(2048, T, dtype=torch.bfloat16).to(d), cos.to(d), sin.to(d), **self.tw,
                             k_cache=self.k_cache, v_cache=self.v_cache, rows_hbm=kv_write_indices([-1] * T, [0] * T, oob).to(d),
                             offs0=o0.to(d), mask0=m0.to(d), **extra, groups=tuple(groups), eps=self.eps)
                 torch.neuron.synchronize()
-                self.log(f"  warmup talker pps={pps} prefill segments={npb}: {time.perf_counter() - t0:.0f}s")
-        # End to end with bursts of 1..4 simultaneous requests: eager ops (codec_head, index_select, ...) compile per
-        # distinct token count T = S + n_prefill_segments * 64, and an uncompiled shape stalls every stream for
+                self.log(f"  warmup talker pps={pps} prefill tiles={npb}: {time.perf_counter() - t0:.0f}s")
+        # End to end with bursts of simultaneous requests: eager ops (codec_head, index_select, ...) compile per
+        # distinct token count T = S + n_prefill_tiles * 128, and an uncompiled shape stalls every stream for
         # seconds the first time it appears under traffic.
-        for burst in (1, 2, 4):
+        # (bursts of 12 / 20 short prompts fill 2 / 3 packed prefill tiles)
+        for burst in (1, 2, 4, 8, 12, 20):
             for _ in range(burst):
                 self.submit("Warm up the engine.", "ryan", "english", sampling=Sampling(max_new_tokens=6))
             while self.step():
@@ -266,7 +287,7 @@ class NeuronTTSEngine:
                         sampling=Sampling(max_new_tokens=8 + (i % 8)))
         while self.step():
             pass
-        self.stats = {"steps": 0, "step_ms": []}
+        self.stats = {"steps": 0, "step_ms": [], "phases": deque(maxlen=4000)}
         self.phase_ms = {}
         self.log(f"warmup done in {time.perf_counter() - t0:.0f}s")
 
@@ -292,12 +313,23 @@ class NeuronTTSEngine:
         tp = t_step
         self._step_phases = []
         decoders = [s for s in self.active() if not s.done]
-        pres = []
-        while self.waiting and any(x is None for x in self.slots) and len(pres) < PREFILL_SEG_BUCKETS[-1]:
+        # admit waiting prompts, packed first-fit into 128-token tiles (varlen prefill, FIFO: stop at the first
+        # prompt that fits nowhere)
+        pres, tiles = [], []                                    # tiles: tokens used per tile
+        while self.waiting and any(x is None for x in self.slots):
+            n = len(self.waiting[0].prompt.text_ids)
+            ti = next((i for i, u in enumerate(tiles) if u + n <= PAGE), None)
+            if ti is None:
+                if len(tiles) == PREFILL_TILE_BUCKETS[-1]:
+                    break
+                tiles.append(0)
+                ti = len(tiles) - 1
             pre = self.waiting.popleft()
             pre.slot = self.slots.index(None)
             self.slots[pre.slot] = pre
             self._reset_codec_row(pre.slot)
+            pre.tile, pre.tile_off = ti, tiles[ti]
+            tiles[ti] += n
             pres.append(pre)
         if pres and not self.mix_prefill:
             decoders = []                                       # debug: prefill-only step (no mixed batch)
@@ -318,41 +350,39 @@ class NeuronTTSEngine:
             wblk[s.slot], woff[s.slot] = s.blocks[s.ctx // PAGE], s.ctx % PAGE
             dec_meta[s.slot] = (s.blocks, s.ctx, 1)
         groups = []
-        max_ctx = max([s.ctx + 1 for s in decoders] + [len(p.prompt.text_ids) for p in pres] + [1])
-        npb = next(b for b in PREFILL_SEG_BUCKETS if b >= len(pres)) if pres else 0
-        pre_rows, pre_meta = [], []
+        max_ctx = max([s.ctx + 1 for s in decoders] + [1])
+        pre_rows = []
         if pres:
-            px = torch.zeros(npb * PREFILL_TOKENS, 2048, dtype=torch.bfloat16)
-            for i in range(npb):
-                base = i * PREFILL_TOKENS
-                if i >= len(pres):                                             # padding segment: no queries
-                    wblk += [-1] * PREFILL_TOKENS
-                    woff += [0] * PREFILL_TOKENS
-                    pre_meta.append(([], 0, 0))
-                    continue
-                pre = pres[i]
+            nt = next(b for b in PREFILL_TILE_BUCKETS if b >= len(tiles))
+            px = torch.zeros(nt * PAGE, 2048, dtype=torch.bfloat16)
+            pwblk, pwoff = [-1] * (nt * PAGE), [0] * (nt * PAGE)
+            ppos = torch.zeros(nt * PAGE, dtype=torch.long)
+            seg = [-1] * (nt * PAGE)
+            for i, pre in enumerate(pres):
                 L_ = len(pre.prompt.text_ids)
+                base = pre.tile * PAGE + pre.tile_off
                 self._alloc(pre, L_)
                 emb = self.P(pre.prompt.text_ids).clone()
                 m = torch.tensor(pre.prompt.codec_mask)
                 emb[m] += self.codec_emb[torch.tensor(pre.prompt.codec_ids)[m]]
                 px[base:base + L_] = emb
-                wblk += [pre.blocks[t // PAGE] for t in range(L_)] + [-1] * (PREFILL_TOKENS - L_)
-                woff += [t % PAGE for t in range(L_)] + [0] * (PREFILL_TOKENS - L_)
-                pre_meta.append((pre.blocks, 0, L_))
+                pwblk[base:base + L_] = [pre.blocks[t // PAGE] for t in range(L_)]
+                pwoff[base:base + L_] = [t % PAGE for t in range(L_)]
+                ppos[base:base + L_] = torch.arange(L_)
+                seg[base:base + L_] = [i] * L_
                 pre_rows.append(S + base + L_ - 1)
             xs = torch.cat([xs, px])
-            pos = torch.cat([pos, torch.arange(PREFILL_TOKENS).repeat(npb)])
+            pos = torch.cat([pos, ppos])
+            wblk += pwblk
+            woff += pwoff
         pps = next(b for b in PPS_BUCKETS if b * PAGE >= max_ctx)
         oob = self.nblk * self.L               # out of range for the WHOLE stacked cache, not just one layer's view
         offs0, mask0 = build_group_metadata(dec_meta, 1, pps, oob)
         groups.append((S, 1, pps))
         extra = {}
         if pres:
-            # prefill queries j >= L_ (and padding segments) are padding: give them no visible keys
-            offs1, mask1 = build_group_metadata(pre_meta, PREFILL_TOKENS, pps, oob)
-            groups.append((npb, PREFILL_TOKENS, pps))
-            extra = dict(offs1=offs1.to(self.device), mask1=mask1.to(self.device))
+            groups.append((nt, PAGE, 0))                  # packed fresh prompts: causal within each prompt
+            extra = dict(offs1=None, mask1=packed_prefill_mask(seg).to(self.device))
         rows = kv_write_indices(wblk, woff, oob)
         cos, sin = rope_tables(pos, self.theta)
         d = self.device
@@ -374,17 +404,8 @@ class NeuronTTSEngine:
 
         # ---- talker sampling
         sampled, cp_rows = {}, []
-        for s, r in zip(owners, sel):
-            lg = logits[r].clone()
-            lg[self.suppress] = -torch.inf
-            if s.n_sampled < 3:                                               # nari: EOS blocked for 3 tokens
-                lg[CODEC_EOS] = -torch.inf
-            if s.sampling.repetition_penalty != 1.0 and s.seen.any():
-                p = s.sampling.repetition_penalty
-                v = lg[s.seen]
-                lg[s.seen] = torch.where(v > 0, v / p, v * p)
-            tok = int(_sample(lg.unsqueeze(0), s.sampling.temperature, s.sampling.top_k, s.sampling.top_p,
-                              s.sampling.greedy, self.gen)[0])
+        toks = self._sample_talker(owners, logits[sel]) if owners else []
+        for s, r, tok in zip(owners, sel, toks):
             if s.forced is not None:                                          # teacher forcing: record, then override
                 s.pred.append([tok])
                 f_i = len(s.frames)
@@ -407,7 +428,7 @@ class NeuronTTSEngine:
                 self._code_predictor(cp_rows, sampled, hT)                    # host path (teacher forcing / tests)
             else:
                 self._code_predictor_device(cp_rows, sampled, hT)
-        tp = self._mark("code predictor (16 NKI steps + host sampling)", tp)
+        tp = self._mark("code predictor (cp_frame NKI)", tp)
 
         # ---- codec: every ``codec_every`` steps decode K frames for each row with >= K pending (the compiled codec
         # front costs ~30 ms per call regardless of K, so batching frames amortizes it). Rows with fewer pending
@@ -415,42 +436,84 @@ class NeuronTTSEngine:
         # zero padding (their padded audio is dropped).
         K = self.codec_every
         if self.stats["steps"] % K == 0:
+            # First audio fast path: a NEW stream with 0 < pending < K frames is decoded zero-padded (the codec is
+            # causal, so its first frames' audio is exact), emitted, and its codec row reset; the next call re-decodes
+            # those ``replay`` frames from the fresh state together with the new ones and emits only the new audio.
             codes = torch.zeros(S, 16, K, dtype=torch.long)
-            emit, fresh = [], []
+            emit, reset = [], []                                               # emit: (stream, skip, n)
             for s in self.active():
                 pending = len(s.frames) - s.audio_frames
-                if pending >= K or (s.done and pending > 0):
+                r = s.replay
+                if r and pending > 0:                                          # replay + new frames, fresh state
+                    n = min(K - r, pending)
+                    codes[s.slot, :, :r + n] = torch.stack(s.frames[s.audio_frames - r:s.audio_frames + n], 1)
+                    emit.append((s, r, n))
+                    s.replay = 0
+                elif pending >= K or (s.done and pending > 0):
                     n = min(K, pending)
                     codes[s.slot, :, :n] = torch.stack(s.frames[s.audio_frames:s.audio_frames + n], 1)
-                    emit.append((s, n))
+                    emit.append((s, 0, n))
                 elif s.audio_frames == 0:
-                    fresh.append(s)
+                    if pending > 0:                                            # fresh, short: emit now, replay later
+                        codes[s.slot, :, :pending] = torch.stack(s.frames[:pending], 1)
+                        emit.append((s, 0, pending))
+                        s.replay = pending
+                    reset.append(s)                                            # undo the zero-code ride-along
             if emit:
                 wav = self.codec(codes.to(d)).float().cpu()                   # [S, 1, K*1920]
                 tp = self._mark("codec chunk (front + NKI)", tp)
-                for s in fresh:                                                # undo the zero-code ride-along
+                for s in reset:
                     self._reset_codec_row(s.slot)
                 now = time.perf_counter()
-                for s, n in emit:
+                for s, skip, n in emit:
                     s.audio_frames += n
                     if s.t_first_audio is None:
                         s.t_first_audio = now
                     if s.sink is not None:
-                        s.sink(wav[s.slot, 0, :n * 1920].numpy())
+                        s.sink(wav[s.slot, 0, skip * 1920:(skip + n) * 1920].numpy())
         for s in self.active():
             if s.done and s.audio_frames >= len(s.frames):
                 s.finished_audio, s.t_done = True, time.perf_counter()
                 if s.sink is not None:
                     s.sink(None)
                 self._release(s)
+        tp = self._mark("host: emit audio + finish", tp)
         self.stats["steps"] += 1
         step_ms = (time.perf_counter() - t_step) * 1e3
         self.stats["step_ms"].append(step_ms)
+        self.stats["phases"].append((step_ms, len(pres), dict(self._step_phases)))
         if step_ms > self.slow_step_ms:
             n_dec = len([s for s in self.active() if not s.done])
             self.log(f"[{self.device}] SLOW STEP {step_ms:.0f} ms (step {self.stats['steps']}, active {n_dec}, "
                      f"prefills {len(pres)}): " + ", ".join(f"{n} {m:.0f}" for n, m in self._step_phases))
         return True
+
+    def _sample_talker(self, owners, lg):
+        """Talker token for every owner row at once (lg [n, V] fp32 host logits): suppress mask, EOS block for the
+        first 3 tokens, repetition penalty, then temperature / top-k / top-p sampling batched over rows that share
+        (top_k, top_p, greedy) -- normally all of them."""
+        lg = lg.clone()
+        lg[:, self.suppress] = -torch.inf
+        early = torch.tensor([s.n_sampled < 3 for s in owners])                      # nari: EOS blocked for 3 tokens
+        lg[early, CODEC_EOS] = -torch.inf
+        pen = torch.tensor([s.sampling.repetition_penalty for s in owners]).unsqueeze(1)
+        if (pen != 1.0).any():
+            seen = torch.stack([s.seen for s in owners])
+            lg = torch.where(seen, torch.where(lg > 0, lg / pen, lg * pen), lg)
+        out = [0] * len(owners)
+        groups = {}
+        for i, s in enumerate(owners):
+            groups.setdefault((s.sampling.top_k, s.sampling.top_p, s.sampling.greedy), []).append(i)
+        for (top_k, top_p, greedy), idx in groups.items():
+            rows = lg[idx]
+            if greedy:
+                tok = rows.argmax(-1)
+            else:
+                temp = torch.tensor([owners[i].sampling.temperature for i in idx]).unsqueeze(1)
+                tok = _sample(rows / temp, 1.0, top_k, top_p, False, self.gen)
+            for i, t in zip(idx, tok.tolist()):
+                out[i] = t
+        return out
 
     def _reset_codec_row(self, row):
         """A new stream starts in ``row``: zero that row of every codec state tensor (KV has batch on dim 1).
@@ -466,35 +529,29 @@ class NeuronTTSEngine:
                 t[row] = 0
                 continue
             shape = [1] * t.dim()
-            bdim = 1 if k in ("tf_k", "tf_v", "fk", "fv") else 0
+            bdim = 3 if k in ("fk", "fv") else 1 if k in ("tf_k", "tf_v") else 0
             shape[bdim] = self.S
             t.mul_(keep_d.to(t.dtype).view(shape))
 
     def _code_predictor_device(self, rows, sampled, hT):
-        """16 fused NKI depth steps with on-device sampling: one H2D (uniforms) and one D2H (16 tokens) per frame."""
+        """Whole CP frame in ONE NKI launch (16 depth steps, on-chip top-k sampling + next-input lookups): one H2D
+        (uniforms) and one D2H (15 tokens) per frame."""
         S, d = self.S, self.device
-        tok0 = torch.zeros(S, dtype=torch.long)
+        tok0 = torch.zeros(S, 1)
         hid_idx = torch.zeros(S, dtype=torch.long)
         inv_t = torch.ones(S, 1)
-        greedy = torch.zeros(S, dtype=torch.bool)
+        greedy = torch.zeros(S, 1)
         for s in rows:
             _, tok, r = sampled[s.slot]
             tok0[s.slot], hid_idx[s.slot] = tok, r
             inv_t[s.slot] = 1.0 / s.sampling.sub_temperature
-            greedy[s.slot] = s.sampling.greedy
-        u = torch.rand(CP_STEPS, S, generator=self.gen).to(d)
-        inv_t, greedy, tok0_d = inv_t.to(d), greedy.to(d), tok0.to(d)
+            greedy[s.slot] = float(s.sampling.greedy)
+        u = torch.rand(S, CP_STEPS - 1, generator=self.gen)
         x = self.small_proj(hT.index_select(0, hid_idx.to(d)))
-        toks = [tok0_d]
-        for st in range(CP_STEPS):
-            logitsT, _ = cp_step(x.t().contiguous(), self.cp_kv, **self.cpw, lm_head=self.cp_heads[max(st - 1, 0)],
-                                 rope=self.cp_rope[st], s=st, eps=self.cp_eps, with_head=True)
-            if st == 0:
-                x = F.embedding(tok0_d, self.proj_l0_dev)
-                continue
-            tok, x = self.sampler(logitsT, u[st], inv_t, greedy, self.proj_res_dev[st - 1])
-            toks.append(tok)
-        frame = torch.stack(toks, 1).cpu()                                      # [S, 16]
+        toks = cp_frame(x.t().contiguous(), tok0.to(d), self.cp_kv, **self.cpw, lm_heads=self.cp_heads,
+                        rope=self.cp_rope, proj_l0=self.proj_l0_dev, proj_res=self.proj_res_rows, u=u.to(d),
+                        inv_t=inv_t.to(d), greedy=greedy.to(d), ident=self.ident_dev, eps=self.cp_eps)
+        frame = torch.cat([tok0.long(), toks.cpu().round().long()], 1)            # [S, 16]
         self._commit_frames(rows, frame)
 
     def _commit_frames(self, rows, frame):

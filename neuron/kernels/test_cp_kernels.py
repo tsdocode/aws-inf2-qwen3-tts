@@ -3,7 +3,7 @@
 Teacher-forced: both sides consume the reference token each step, so per-step error does not compound.
 Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/kernels/test_cp_kernels.py --batch 32 --steps 6
 """
-import argparse, copy, sys, time
+import argparse, copy, sys
 from pathlib import Path
 
 import torch
@@ -78,20 +78,17 @@ def main():
     with torch.no_grad():
         x = predictor.small_to_mtp_projection((torch.randn(B, 2048) * 0.5).to(torch.bfloat16))
         tokens = torch.randint(0, 2048, (B,))
+        kv32 = None
         for s in range(a.steps):
             if s > 0:  # teacher forcing: next input = projected embedding of the reference token
                 x = F.embedding(tokens, frame.proj_layer0 if s == 1 else frame.proj_residual[s - 2])
             logits32, _, kv32 = ref_layers(step32, x.float(), kv32 if s else kv.float(), s)
             logits_ref, hidden_ref, kv = ref_layers(step, x, kv, s)
-            t0 = time.perf_counter()
             logitsT, hidden = cp_step(x.t().contiguous().to("neuron"), kv_dev, **dev, lm_head=heads_dev[max(s - 1, 0)],
                                       rope=rope_dev[s], s=s, eps=eps,
                                       **(dict(lm_head_s=heads_s_dev[max(s - 1, 0)]) if heads_s_dev is not None else {}))
             got = logitsT.cpu().float().t()
-            dt = time.perf_counter() - t0
             rel = ((got - logits_ref).norm() / logits_ref.norm()).item()
-            agree = (got.argmax(-1) == logits_ref.argmax(-1)).float().mean().item() * 100
-            hrel = ((hidden.cpu().float().t() - hidden_ref.float()).norm() / hidden_ref.float().norm()).item()
             kv_err = ((kv_dev.cpu().float() - to_kernel_kv(kv).float()).abs().max()).item()
             r32_cpu = ((logits_ref - logits32).norm() / logits32.norm()).item()
             r32_k = ((got - logits32).norm() / logits32.norm()).item()

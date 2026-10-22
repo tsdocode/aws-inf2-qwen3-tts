@@ -52,9 +52,9 @@ def ref_step(tf, hidden, pos, ctx, tf_k, tf_v):
     return tf.norm(hidden), torch.stack(nk), torch.stack(nv)
 
 
-def to_kernel_state(t):   # [L, B, 16, R, 64] -> [L, B, 8, 128, R] (pair dims: even head 0..63, odd head 64..127)
+def to_kernel_state(t):   # [L, B, 16, R, 64] -> [L, 8, 128, B, R] (pair dims: even head 0..63, odd head 64..127)
     L, B = t.shape[:2]
-    return t.reshape(L, B, 8, 2, R, 64).permute(0, 1, 2, 3, 5, 4).reshape(L, B, 8, 128, R).contiguous()
+    return t.reshape(L, B, 8, 2, R, 64).permute(0, 2, 3, 5, 1, 4).reshape(L, 8, 128, B, R).contiguous()
 
 
 def main():

@@ -80,7 +80,7 @@ def paged_io(k_cache, v_cache, k_newT, v_newT, k_widx, v_widx, pages):
 
 def main():
     torch.manual_seed(0)
-    NBLK, T, NP = 12, 5, 4
+    NBLK, T = 12, 5
     kc = torch.randn(NBLK, D, BL, KVH).to(torch.bfloat16)
     vc = torch.randn(NBLK, BL, KVH, D).to(torch.bfloat16)
     k_new = torch.randn(T, KVH, D).to(torch.bfloat16)

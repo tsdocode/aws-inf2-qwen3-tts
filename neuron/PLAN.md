@@ -349,3 +349,28 @@ Candidates, in expected order of payoff:
 
 ### 4. Load test + tuning (days 6–7)
 Batch buckets, chunk schedule, admission policy, TTFA p50/p95/p99 at 64 CCU, RTF per stream.
+
+### 2026-10-22: real time at 64 streams (one process per core + router)
+- Codec front transformer kernel 12.1 -> 3.3 ms (B=32, F=2): state DMAs were split into B*128 ~140 B descriptors
+  (strided SBUF destination, 13 GB/s) -> layout [L, pair, 128, B, R] + contiguous staging tiles; staging copies on
+  ScalarE (VectorE was the busy engine). Codec call F=2 36.7 -> 27.9 ms.
+- `cp_frame`: whole CP frame in ONE launch (16 depth steps + on-chip top-50 sampling + next-input gathers).
+  19.0 -> 14.3 ms per frame, tokens 100% identical to cp_step + _DeviceSampler (greedy and sampled).
+  gen2 gaps: nc_match_replace8 with dst_idx unimplemented (use nc_find_index8 on an untouched copy);
+  tensor_scalar_cumulative fails to lower in context (cumsum as transpose + triangular-ones matmul).
+- Talker dense part is at the HBM ceiling (11.0 ms, 247 GB/s, no attention). Attention+KV write adds ~8 ms
+  (~3x its byte floor): ~78k tiny matmuls/step (per page x head: transpose, QK with 2 moving columns, PV).
+- 64-stream load test (90 s, 0 errors): **RTF p50 0.88, 71.3x aggregate, stalls >50 ms in 1.3% of requests**;
+  TTFA all p50 276 / p95 329 / p99 816 ms; steady state p50 276 / p95 311 / p99 325 / max 343 ms.
+  Mean step 66 ms; host Python ~12.5 ms/step (batch build 5.5, sampling 4.7, emit 2.2).
+- Host fixes after that run: top-k-first host sampler 3.2 -> 0.9 ms; vectorized build_group_metadata
+  (decode 1.1 -> 0.14 ms, prefill group 3.5 -> 0.26 ms, identical output).
+- TensorE cost model (measured, bf16, K=128): ~130 ns fixed per nc_matmul up to ~128 moving columns, 345 ns at 512
+  columns (= PE peak); stationary width barely matters. => fewer, wider matmuls; never a short trailing token chunk.
+- Prefill: an 8-prompt step (8 x 64 padded tokens, T=544) cost 63-65 ms of talker vs 22.4 decode-only. Causes: padding
+  (real prompts are 17-32 tokens) and T=544 > 512 (every weight block ran a second 32-token matmul, ~11 ms).
+  **Varlen packed prefill** (`_attend_packed`, group (n_tiles, 128, 0)): fresh prompts packed first-fit into
+  128-token tiles; causal block-diagonal attention on this step's q/k/v straight from SBUF (no page reads, no K
+  transposes, queries on partitions, 4 heads per pass). Buckets 1/2/3 tiles (T <= 416). 3 tiles (~12-15 real prompts)
+  = 42.3 ms vs 63-65 ms for 8 padded prompts. Accuracy vs fp32 oracle: packed 1.46e-1 vs padded 1.59e-1 (prompt
+  rows; bf16 drift level), decode rows bit-identical.

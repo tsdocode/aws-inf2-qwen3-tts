@@ -240,8 +240,8 @@ class StreamingCodecDecoder:
         if self.nki_front:
             del st["tf_k"], st["tf_v"]
             R = self.front_mod.retained
-            st["fk"] = torch.zeros(self.tf_layers, self.B, 8, 128, R, dtype=torch.bfloat16).to(self.device)
-            st["fv"] = torch.zeros(self.tf_layers, self.B, 8, 128, R, dtype=torch.bfloat16).to(self.device)
+            st["fk"] = torch.zeros(self.tf_layers, 8, 128, self.B, R, dtype=torch.bfloat16).to(self.device)
+            st["fv"] = torch.zeros(self.tf_layers, 8, 128, self.B, R, dtype=torch.bfloat16).to(self.device)
             st["pos"] = torch.zeros(self.B, dtype=torch.long)        # host: RoPE tables + masks are built on the host
             st["ctx"] = torch.zeros(self.B, dtype=torch.long)
         for i, ((_, _, cin), units) in enumerate(self.blocks):

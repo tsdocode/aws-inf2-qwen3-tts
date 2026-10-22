@@ -52,7 +52,6 @@ async def client_loop(client, url, stop_at, results, rng):
 
 
 async def main_async(a):
-    rng = random.Random(0)
     results = []
     limits = httpx.Limits(max_connections=a.concurrency * 2, max_keepalive_connections=a.concurrency * 2)
     async with httpx.AsyncClient(timeout=None, limits=limits) as client:

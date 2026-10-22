@@ -16,6 +16,19 @@ GOLDEN = Path(__file__).resolve().parents[1] / "golden"
 MODEL = str(Path.home() / "models/Qwen3-TTS-12Hz-1.7B-CustomVoice")
 
 
+_REF = {}
+
+
+def ref_codec():
+    """Upstream codec decoder, CPU fp32 (loaded once)."""
+    if "dec" not in _REF:
+        from nari_qwen3_tts.config import ModelAssetConfig
+        from nari_qwen3_tts.model.checkpoint import CheckpointLoader
+        loader = CheckpointLoader(ModelAssetConfig(model_id=MODEL, device="cpu", require_h100=False, local_files_only=True))
+        _REF["dec"] = loader.load_codec(device=torch.device("cpu"), dtype=torch.float32).float().decoder.eval()
+    return _REF["dec"]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--codec-every", type=int, default=2)
@@ -23,6 +36,8 @@ def main():
     ap.add_argument("--only", default=None)
     ap.add_argument("--teacher", action="store_true", help="teacher-force golden frames; report per-step agreement")
     ap.add_argument("--no-mix", action="store_true")
+    ap.add_argument("--audio-check", action="store_true",
+                    help="SNR of the streamed audio vs the upstream whole-sequence fp32 decoder on the same frames")
     a = ap.parse_args()
     torch._dynamo.config.automatic_dynamic_shapes = False
     eng = NeuronTTSEngine(MODEL, slots=a.slots, mix_prefill=not a.no_mix, codec_every=a.codec_every)
@@ -51,6 +66,13 @@ def main():
         allg = (got[:n] == gold[:n]).float().mean().item() * 100 if n else 0
         wav = np.concatenate(audio[name]) if audio[name] else np.zeros(0)
         sf.write(GOLDEN.parent / "golden" / f"{name}.neuron.wav", wav, 24000)
+        if a.audio_check:
+            with torch.no_grad():
+                ref = ref_codec()(got.t().unsqueeze(0)).float().reshape(-1).numpy()
+            m_ = min(len(ref), len(wav))
+            snr = 10 * np.log10((ref[:m_] ** 2).sum() / max(((wav[:m_] - ref[:m_]) ** 2).sum(), 1e-20))
+            print(f"    streamed audio vs whole-sequence fp32 decode of the same frames: SNR {snr:.1f} dB "
+                  f"({len(wav)} vs {len(ref)} samples)")
         print(f"{name}: frames neuron {len(got)} vs golden {len(gold)} | first {first_bad} frames exact | "
               f"codebook-0 match {g0:.0f}% | all-code match {allg:.0f}% | TTFA {(s.t_first_audio - s.t_submit) * 1e3:.0f} ms "
               f"(incl. compile on first run) | audio {len(wav) / 24000:.2f}s")

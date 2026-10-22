@@ -1,0 +1,12 @@
+aws-inf2-qwen3-tts
+Qwen3-TTS serving on AWS Inferentia2 (NKI kernels, engine, server) — the neuron/ directory.
+
+This product is a derivative of nari-qwen3-tts by Nari Labs
+(https://github.com/nari-labs/nari-qwen3-tts), licensed under the Apache License, Version 2.0.
+Changes relative to upstream: added the neuron/ directory (Inferentia2 NKI kernels, engine, HTTP server,
+router, tests, benchmarks, engineering log); README.md rewritten for the port (the original is preserved,
+with fixed relative links, in docs/README.nari.md); .gitignore extended. The upstream package under src/ is
+unchanged.
+
+It runs the Qwen3-TTS models by the Qwen team, Alibaba (https://github.com/QwenLM/Qwen3-TTS, Apache-2.0
+code); model weights are distributed separately under the terms on their model cards.
