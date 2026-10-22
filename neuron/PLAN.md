@@ -276,6 +276,12 @@ One NKI kernel per depth step: 5 layers + final norm + lm_head, KV slot written 
 - Next: (a) call the codec every K steps (F=K) with a TTFA fast path for new streams, or (b) NKI kernel
   for the front transformer (removes the ~30 ms fixed cost). Then 2 cores + HTTP + load test.
 
+### Chunked codec (option A) — 32 streams/core real time
+codec every K steps, K frames per row (rows with < K pending: fresh -> state reset; done -> zero-padded flush).
+32 slots / 32 requests: K=1 91.5 ms median step | K=2 72.4 ms (11.2x RT aggregate) | **K=4 49.1 ms median,
+68 ms average (16.3x RT aggregate)** → real time at 32 streams per core. Burst TTFA (32 at t=0) p50 1.7 s is
+pure admission queueing (one prefill per step) → next: several prefill segments per step.
+
 ### Running total per frame-batch (B=32 per core)
 talker 29.6 (compiled) + CP 32.1 (compiled) + codec 9.4 (NKI) = 71.1 ms →
 talker 29.6 (compiled) + CP 12.6 (NKI) + codec 9.4 (NKI) = 51.6 ms →

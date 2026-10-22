@@ -18,13 +18,14 @@ MODEL = str(Path.home() / "models/Qwen3-TTS-12Hz-1.7B-CustomVoice")
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--codec-every", type=int, default=2)
     ap.add_argument("--slots", type=int, default=4)
     ap.add_argument("--only", default=None)
     ap.add_argument("--teacher", action="store_true", help="teacher-force golden frames; report per-step agreement")
     ap.add_argument("--no-mix", action="store_true")
     a = ap.parse_args()
     torch._dynamo.config.automatic_dynamic_shapes = False
-    eng = NeuronTTSEngine(MODEL, slots=a.slots, mix_prefill=not a.no_mix)
+    eng = NeuronTTSEngine(MODEL, slots=a.slots, mix_prefill=not a.no_mix, codec_every=a.codec_every)
     meta = json.loads((GOLDEN / "meta.json").read_text())
     streams, audio = {}, {}
     for name, m in meta.items():

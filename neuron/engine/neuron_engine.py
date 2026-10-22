@@ -111,7 +111,8 @@ def _sample(logits, temperature, top_k, top_p, greedy, gen):
 
 
 class NeuronTTSEngine:
-    def __init__(self, model_dir, slots=32, device="neuron", seed=0, log=print, mix_prefill=True, profile=False):
+    def __init__(self, model_dir, slots=32, device="neuron", seed=0, log=print, mix_prefill=True, profile=False,
+                 codec_every=2):
         from nari_qwen3_tts.config import ModelAssetConfig
         from nari_qwen3_tts.model.checkpoint import CheckpointLoader
         from transformers import Qwen2TokenizerFast
@@ -119,6 +120,7 @@ class NeuronTTSEngine:
         self.log, self.device, self.S = log, device, slots
         self.mix_prefill = mix_prefill
         self.profile = profile
+        self.codec_every = codec_every
         self.phase_ms = {}
         self.gen = torch.Generator().manual_seed(seed)
         t0 = time.perf_counter()
@@ -357,23 +359,34 @@ class NeuronTTSEngine:
                 self._code_predictor_device(cp_rows, sampled, hT)
         tp = self._mark("code predictor (16 NKI steps + host sampling)", tp)
 
-        # ---- codec: one frame for every slot (inactive rows decode silence codes; their output is dropped)
-        codes = torch.zeros(S, 16, 1, dtype=torch.long)
-        emit = []
-        for s in self.active():
-            if s.frames and s.audio_frames < len(s.frames):
-                codes[s.slot, :, 0] = s.frames[s.audio_frames]
-                emit.append(s)
-        if emit:
-            wav = self.codec(codes.to(d)).float().cpu()                       # [S, 1, 1920]
-            tp = self._mark("codec frame (front + NKI)", tp)
-            now = time.perf_counter()
-            for s in emit:
-                s.audio_frames += 1
-                if s.t_first_audio is None:
-                    s.t_first_audio = now
-                if s.sink is not None:
-                    s.sink(wav[s.slot, 0].numpy())
+        # ---- codec: every ``codec_every`` steps decode K frames for each row with >= K pending (the compiled codec
+        # front costs ~30 ms per call regardless of K, so batching frames amortizes it). Rows with fewer pending
+        # frames (just started) ride along with zero codes and get their state reset; finished rows flush with
+        # zero padding (their padded audio is dropped).
+        K = self.codec_every
+        if self.stats["steps"] % K == 0:
+            codes = torch.zeros(S, 16, K, dtype=torch.long)
+            emit, fresh = [], []
+            for s in self.active():
+                pending = len(s.frames) - s.audio_frames
+                if pending >= K or (s.done and pending > 0):
+                    n = min(K, pending)
+                    codes[s.slot, :, :n] = torch.stack(s.frames[s.audio_frames:s.audio_frames + n], 1)
+                    emit.append((s, n))
+                elif s.audio_frames == 0:
+                    fresh.append(s)
+            if emit:
+                wav = self.codec(codes.to(d)).float().cpu()                   # [S, 1, K*1920]
+                tp = self._mark("codec chunk (front + NKI)", tp)
+                for s in fresh:                                                # undo the zero-code ride-along
+                    self._reset_codec_row(s.slot)
+                now = time.perf_counter()
+                for s, n in emit:
+                    s.audio_frames += n
+                    if s.t_first_audio is None:
+                        s.t_first_audio = now
+                    if s.sink is not None:
+                        s.sink(wav[s.slot, 0, :n * 1920].numpy())
         for s in self.active():
             if s.done and s.audio_frames >= len(s.frames):
                 s.finished_audio, s.t_done = True, time.perf_counter()

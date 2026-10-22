@@ -19,13 +19,14 @@ TEXTS = ["The quick brown fox jumps over the lazy dog, and then it runs back hom
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--codec-every", type=int, default=2)
     ap.add_argument("--slots", type=int, default=32)
     ap.add_argument("--requests", type=int, default=32)
     ap.add_argument("--profile", action="store_true")
     ap.add_argument("--max-new-tokens", type=int, default=150)
     a = ap.parse_args()
     torch._dynamo.config.automatic_dynamic_shapes = False
-    eng = NeuronTTSEngine(MODEL, slots=a.slots, profile=a.profile)
+    eng = NeuronTTSEngine(MODEL, slots=a.slots, profile=a.profile, codec_every=a.codec_every)
     eng.warmup()
     streams = [eng.submit(TEXTS[i % len(TEXTS)], "ryan", "english", sampling=Sampling(max_new_tokens=a.max_new_tokens))
                for i in range(a.requests)]
