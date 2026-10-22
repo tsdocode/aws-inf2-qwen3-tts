@@ -77,14 +77,14 @@ Rules learned:
 ### Baseline per frame-batch (B=32 per core, compiler codegen, no NKI)
 Talker 29.6 + CP 32.1 + codec 37.5 (fp32) = **99.2 ms vs 80 ms real-time budget** → kernels required.
 
-### CORRECTION (sustained bandwidth, `kernels/dma_both_cores.py`): 67 MB streams looped back-to-back
+### CORRECTION (sustained bandwidth, `bench/dma_both_cores.py`): 67 MB streams looped back-to-back
 - **257 GB/s per NeuronCore sustained; both cores at once 251 + 257 ≈ 508 GB/s per chip** (no contention).
   NVIDIA L4: 300 GB/s spec (~240–270 achievable) → inf2 chip ≈ 1.9x L4 *if both cores stream*.
 - The "175–180 GB/s ceiling" below was a single short 8 MB call dominated by ~10 µs fixed start cost.
   Lesson: per-kernel fixed overhead matters → fewer, longer fused kernels approach 257 GB/s.
 - Revised talker floor: 2.8 GB bf16 weights / 257 GB/s ≈ 11 ms (+ KV) per step at B=32.
 
-### Measured DMA ceiling (`kernels/dma_ceiling.py`) — superseded by the correction above
+### Measured DMA ceiling (`bench/dma_ceiling.py`) — superseded by the correction above
 Pure HBM→SBUF stream on one inf2 NeuronCore: **~175–180 GB/s end-to-end** (~220 GB/s while active),
 independent of 4–64 KiB/partition payloads. Not 410 (chip HBM/2) nor 272 (doc DMA peak).
 Revised floors @ ~200 GB/s, B=32/core: talker 17–23 ms (weights 2.8 GB + KV), CP 15.5 ms, codec
@@ -213,7 +213,7 @@ One NKI kernel per depth step: 5 layers + final norm + lm_head, KV slot written 
   prefill+decode is nearly free on the dense side; only attention scales with tokens x context.
 - Target with paged attention: ~11.7 + KV read (1.9 GB @ ctx 512 ≈ 7.3 ms) ≈ 19 ms vs 29.6 compiled.
 
-### Paged KV on gen2 (`kernels/test_paged_io.py`) — idioms verified bit-exact on inf2
+### Paged KV on gen2 (`tests/test_paged_io.py`) — idioms verified bit-exact on inf2
 - K cache D-major `[blocks, D, BL, KVH]`, V cache token-major `[blocks, BL, KVH, D]` (BL=128): each page
   gather is one `vector_select` DMA with 2 KiB contiguous per partition, landing directly in the
   stationary layouts for QK^T (K: [D, keys]) and PV (V: [keys, D]).

@@ -1,6 +1,6 @@
 """End-to-end engine check on inf2: greedy generation of the golden prompts vs CPU fp32 upstream codes.
 
-Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/engine/test_engine_golden.py --slots 4
+Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/tests/test_engine_golden.py --slots 4
 """
 import argparse, json, sys, time
 from pathlib import Path
@@ -9,7 +9,7 @@ import numpy as np
 import soundfile as sf
 import torch
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parents[1] / "engine"))
 from neuron_engine import NeuronTTSEngine, Sampling  # noqa: E402
 
 GOLDEN = Path(__file__).resolve().parents[1] / "golden"

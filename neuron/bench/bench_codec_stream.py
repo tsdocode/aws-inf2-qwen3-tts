@@ -1,12 +1,12 @@
 """Per-stage time of one streaming codec chunk (B rows x F frames) on inf2.
-Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/kernels/bench_codec_stream.py --rows 32 --frames 1
+Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/bench/bench_codec_stream.py --rows 32 --frames 1
 """
 import argparse, sys, time
 from pathlib import Path
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parents[1] / "kernels"))
 sys.path.insert(0, str(Path(__file__).parents[1] / "proto"))
 from codec_kernels import residual_unit, snake_conv_out, snake_transconv  # noqa: E402
 from codec_front_kernels import front_attention_mask, front_rope_tables, front_transformer  # noqa: E402

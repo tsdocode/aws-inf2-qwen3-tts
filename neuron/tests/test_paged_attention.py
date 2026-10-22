@@ -1,13 +1,13 @@
 """Mixed decode + prefill paged attention (NKI) vs dense torch attention, one layer.
 
-Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/kernels/test_paged_attention.py --decode 32 --prefill 64 --pps 4
+Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/tests/test_paged_attention.py --decode 32 --prefill 64 --pps 4
 """
 import argparse, sys, time
 from pathlib import Path
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parents[1] / "kernels"))
 from talker_kernels import PAGE, build_group_metadata, paged_attention  # noqa: E402
 
 D, NH, KVH = 128, 16, 8

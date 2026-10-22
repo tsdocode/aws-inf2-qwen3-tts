@@ -1,13 +1,13 @@
 """Time a full CP frame (16 fused step-kernel calls) at batch B; compare with the compiled step graph (32.1 ms).
 
-Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/kernels/bench_cp_kernels.py --batch 32
+Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/bench/bench_cp_kernels.py --batch 32
 """
 import argparse, sys, time
 from pathlib import Path
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parents[1] / "kernels"))
 sys.path.insert(0, str(Path(__file__).parents[1] / "proto"))
 from cp_graph import MODEL  # noqa: E402
 from cp_kernels import SLOTS, cp_step, cp_step_params  # noqa: E402

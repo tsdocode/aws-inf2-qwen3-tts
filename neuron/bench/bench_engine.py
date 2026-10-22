@@ -1,6 +1,6 @@
 """Engine step-time breakdown and throughput with N concurrent synthetic requests.
 
-Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/engine/bench_engine.py --slots 32 --requests 32 [--profile]
+Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/bench/bench_engine.py --slots 32 --requests 32 [--profile]
 """
 import argparse, sys, time
 from pathlib import Path
@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parents[1] / "engine"))
 from neuron_engine import NeuronTTSEngine, Sampling  # noqa: E402
 
 MODEL = str(Path.home() / "models/Qwen3-TTS-12Hz-1.7B-CustomVoice")

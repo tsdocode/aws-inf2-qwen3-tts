@@ -1,6 +1,6 @@
 """Page-gather DMA throughput on inf2: vector_select (per-partition offsets) vs scalar_offset (one runtime base
 per contiguous page) vs static (compile-time offsets, upper bound). 64 pages x 256 KB = 16.8 MB.
-Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/kernels/bench_page_gather.py
+Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/bench/bench_page_gather.py
 """
 import time
 

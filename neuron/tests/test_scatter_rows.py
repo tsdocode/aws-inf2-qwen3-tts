@@ -1,6 +1,6 @@
 """inf2: can ONE dma_copy scatter T token rows (tokens on partitions) to runtime rows via a per-partition
 vector_offset on the destination? Out-of-range rows must be skipped (padding tokens).
-Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/kernels/test_scatter_rows.py
+Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/tests/test_scatter_rows.py
 """
 import time
 

@@ -1,7 +1,7 @@
 """Fused CP step kernel vs the CPU step math (proto/cp_step_graph.Step, itself checked against the repo).
 
 Teacher-forced: both sides consume the reference token each step, so per-step error does not compound.
-Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/kernels/test_cp_kernels.py --batch 32 --steps 6
+Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/tests/test_cp_kernels.py --batch 32 --steps 6
 """
 import argparse, copy, sys
 from pathlib import Path
@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parents[1] / "kernels"))
 sys.path.insert(0, str(Path(__file__).parents[1] / "proto"))
 from cp_graph import MODEL, WholeFrameCodePredictor  # noqa: E402
 from cp_kernels import SLOTS, cp_step, cp_step_params  # noqa: E402

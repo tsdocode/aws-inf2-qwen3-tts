@@ -1,14 +1,14 @@
 """Weight-only FP8 decode linear on inf2: (1) device fp8 decode matches ml_dtypes legacy e4m3,
 (2) kernel vs host math on the *dequantized* weights (isolates kernel error from quantization error),
 (3) quantization error vs bf16 weights, (4) device time vs the bf16 kernel (profile with tools/profile_neff.py).
-Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/kernels/test_decode_linear_fp8.py --K 2048 --N 6144 --B 32
+Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/tests/test_decode_linear_fp8.py --K 2048 --N 6144 --B 32
 """
 import argparse, sys
 from pathlib import Path
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parents[1] / "kernels"))
 from decode_linear import dequantize_fp8_e4m3, quantize_fp8_e4m3, rmsnorm_linear_fp8_t  # noqa: E402
 from test_decode_linear import ref  # noqa: E402
 

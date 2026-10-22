@@ -1,7 +1,7 @@
 """NKI codec front transformer vs the exact streaming CPU reference (StreamingFront's transformer math).
 
 Two consecutive chunks (F=1 then F=4) on B rows with different prior context lengths; real inputs (golden codes
-through quantizer -> pre_conv -> input_proj). Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/kernels/test_codec_front.py
+through quantizer -> pre_conv -> input_proj). Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/tests/test_codec_front.py
 """
 import argparse, sys, time
 from pathlib import Path
@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parents[1] / "kernels"))
 sys.path.insert(0, str(Path(__file__).parents[1] / "proto"))
 from codec_front_kernels import front_attention_mask, front_rope_tables, front_transformer, front_transformer_params  # noqa: E402
 from codec_stream import _rotate_half  # noqa: E402

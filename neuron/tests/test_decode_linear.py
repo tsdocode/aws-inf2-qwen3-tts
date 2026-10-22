@@ -2,14 +2,14 @@
 
 Timing: eager NKI calls each pay a NEFF launch; we time a loop of calls and report both wall time
 per call and (with --profile) device time from neuron-explorer.
-Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/kernels/test_decode_linear.py --K 1024 --N 4096 --B 32
+Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/tests/test_decode_linear.py --K 1024 --N 4096 --B 32
 """
 import argparse, sys, time
 from pathlib import Path
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parents[1] / "kernels"))
 from decode_linear import rmsnorm_linear_t, tile_weight  # noqa: E402
 
 

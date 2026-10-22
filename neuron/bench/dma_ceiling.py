@@ -1,7 +1,7 @@
 """Measure achievable HBM->SBUF bandwidth on one inf2 NeuronCore (no compute).
 
 Streams a [NB, 128, F] tensor block by block into SBUF; reduces one element per block so the loads
-are not dead code. Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/kernels/dma_ceiling.py --mb 8 --free 8192
+are not dead code. Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/bench/dma_ceiling.py --mb 8 --free 8192
 """
 import argparse
 

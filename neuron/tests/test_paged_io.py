@@ -3,7 +3,7 @@
 (1) per-token K/V writes at runtime (block, offset): K cache D-major [NBLK, D, BL, KVH] via scalar_offset,
     V cache token-major [NBLK, BL, KVH, D] via scalar_offset on a transposed (token-major) source;
 (2) page gathers by a runtime block table with vector_select (partition p reads row blk*rows_per_blk + p).
-Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/kernels/test_paged_io.py
+Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/tests/test_paged_io.py
 """
 import nki
 import nki.isa as nisa

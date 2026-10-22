@@ -1,7 +1,7 @@
 """cp_frame (one launch per frame) vs the per-step path (16 cp_step launches + compiled _DeviceSampler): same uniforms,
 same inputs -> tokens should match (greedy and sampled); also times both.
 
-Usage: NEURON_RT_VISIBLE_CORES=0 python neuron/kernels/test_cp_frame.py --batch 32
+Usage: NEURON_RT_VISIBLE_CORES=0 python neuron/tests/test_cp_frame.py --batch 32
 """
 import argparse, sys, time
 from pathlib import Path
@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parents[1] / "kernels"))
 sys.path.insert(0, str(Path(__file__).parents[1] / "proto"))
 sys.path.insert(0, str(Path(__file__).parents[1] / "engine"))
 from cp_graph import MODEL  # noqa: E402

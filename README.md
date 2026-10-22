@@ -70,22 +70,28 @@ kernels are cached under `~/.cache/qtts-neuron/`, keyed by the kernel sources.
 
 ## Tests and benchmarks
 
-- `neuron/engine/test_engine_golden.py --teacher --audio-check` — end to end vs the CPU fp32 golden codes and audio
-- `neuron/kernels/test_*.py` — each kernel vs a PyTorch / fp32 reference
-- `neuron/kernels/bench_*.py`, `neuron/engine/bench_engine.py --profile` — per-kernel and per-phase timings
+Each script runs on one NeuronCore, e.g. `NEURON_RT_VISIBLE_CORES=0 python neuron/tests/test_cp_frame.py`.
+
+- `neuron/tests/test_engine_golden.py --teacher --audio-check` — end to end vs the CPU fp32 golden codes and audio
+- `neuron/tests/test_*.py` — each kernel vs a PyTorch / fp32 reference
+- `neuron/bench/bench_*.py` — per-kernel timings; `neuron/bench/bench_engine.py --profile` — per-phase step times;
+  `neuron/bench/dma_*.py` — HBM bandwidth probes
 - `neuron/tools/profile_neff.py` — device profile (neuron-explorer) of one kernel
 
 ## Layout
 
 ```
 neuron/
-  kernels/    NKI kernels + their tests and benchmarks
-  engine/     engine, HTTP server, router, load test, golden test
+  kernels/    NKI kernels only (talker, code predictor, codec) + their host-side parameter prep
+  engine/     engine, HTTP server, router, launcher, load generator
+  tests/      kernel and end-to-end accuracy tests
+  bench/      kernel / engine benchmarks and hardware probes
   reference/  CPU fp32 golden generation
   golden/     golden codes / audio for the accuracy tests
   proto/      early compiled-graph prototypes (baselines in PLAN.md)
   tools/      profiling helpers
   PLAN.md     engineering log
+  setup_env.sh
 src/nari_qwen3_tts/   upstream package (unchanged)
 docs/README.nari.md   upstream README
 ```

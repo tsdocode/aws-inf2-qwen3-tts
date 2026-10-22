@@ -1,13 +1,13 @@
 """Fused SnakeBeta + causal ConvTranspose1d (NKI) vs upstream fp32, every decoder block, real activations.
 
-Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/kernels/test_codec_transconv.py --rows 4 --frames 16
+Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/tests/test_codec_transconv.py --rows 4 --frames 16
 """
 import argparse, sys, time
 from pathlib import Path
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parents[1] / "kernels"))
 sys.path.insert(0, str(Path(__file__).parents[1] / "proto"))
 from codec_kernels import snake_transconv, snake_transconv_params  # noqa: E402
 from cp_graph import MODEL  # noqa: E402

@@ -1,13 +1,13 @@
 """Fused codec residual unit (NKI) vs upstream fp32 module on real decoder activations.
 
-Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/kernels/test_codec_kernels.py --rows 4 --frames 16
+Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/tests/test_codec_kernels.py --rows 4 --frames 16
 """
 import argparse, sys, time
 from pathlib import Path
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parents[1] / "kernels"))
 sys.path.insert(0, str(Path(__file__).parents[1] / "proto"))
 from codec_kernels import residual_unit, residual_unit_params  # noqa: E402
 from cp_graph import MODEL  # noqa: E402

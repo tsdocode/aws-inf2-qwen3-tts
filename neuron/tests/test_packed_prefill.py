@@ -3,14 +3,14 @@
 Decode streams + 3 prompts of different lengths: path A pads each prompt to a 64-token segment (groups
 (S,1,pps) + (4,64,pps)); path B packs them back to back in one 128-token tile (groups (S,1,pps) + (1,128,0)).
 Compares the final hidden at every real token and the K/V rows written to the caches.
-Usage: NEURON_RT_VISIBLE_CORES=0 python neuron/kernels/test_packed_prefill.py
+Usage: NEURON_RT_VISIBLE_CORES=0 python neuron/tests/test_packed_prefill.py
 """
 import sys
 from pathlib import Path
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parents[1] / "kernels"))
 sys.path.insert(0, str(Path(__file__).parents[1] / "proto"))
 from cp_graph import MODEL  # noqa: E402
 from nari_qwen3_tts.config import ModelAssetConfig  # noqa: E402

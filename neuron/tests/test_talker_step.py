@@ -3,14 +3,14 @@
 History: each sequence's prior context (real codec-embedding rows) runs through the CPU Talker to build real
 per-layer K/V, which is scattered into the device paged caches. Then one mixed step (decode tokens + one
 prefill chunk) runs on both sides. Reports kernel vs CPU bf16, and both vs a CPU fp32 oracle.
-Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/kernels/test_talker_step.py --decode 4 --prefill 32
+Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/tests/test_talker_step.py --decode 4 --prefill 32
 """
 import argparse, copy, sys, time
 from pathlib import Path
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parents[1] / "kernels"))
 sys.path.insert(0, str(Path(__file__).parents[1] / "proto"))
 from cp_graph import MODEL  # noqa: E402
 from nari_qwen3_tts.config import ModelAssetConfig  # noqa: E402

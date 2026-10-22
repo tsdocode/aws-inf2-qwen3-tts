@@ -1,14 +1,14 @@
 """Streaming codec (chunked, stateful) vs upstream whole-sequence fp32 decoder on golden codes.
 
 Chunk schedule like nari's ttfa profile ([1, 2, 4, 8] then 12s). Usage:
-NEURON_RT_VISIBLE_CORES=1 python neuron/kernels/test_codec_stream.py --rows 2 --schedule 1 2 4 8 12 12 12 12
+NEURON_RT_VISIBLE_CORES=1 python neuron/tests/test_codec_stream.py --rows 2 --schedule 1 2 4 8 12 12 12 12
 """
 import argparse, sys, time
 from pathlib import Path
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parents[1] / "kernels"))
 sys.path.insert(0, str(Path(__file__).parents[1] / "proto"))
 from codec_stream import StreamingCodecDecoder  # noqa: E402
 from cp_graph import MODEL  # noqa: E402

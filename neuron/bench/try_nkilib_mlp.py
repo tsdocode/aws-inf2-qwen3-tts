@@ -1,7 +1,7 @@
 """Does NKI-Lib's TKG MLP (fused add + RMSNorm + SwiGLU) run correctly and fast on inf2 (gen2)?
 
 Compares against torch math and the torch.compile(backend="neuron") baseline at decode shapes.
-Usage: python neuron/kernels/try_nkilib_mlp.py --tokens 32 --hidden 1024 --inter 3072
+Usage: python neuron/bench/try_nkilib_mlp.py --tokens 32 --hidden 1024 --inter 3072
 """
 import argparse, time
 

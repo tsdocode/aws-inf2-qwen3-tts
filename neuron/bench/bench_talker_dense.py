@@ -1,13 +1,13 @@
 """(1) per-token QK-norm+RoPE + dense path correctness vs torch for 1 layer (attention stub mirrored on CPU),
 (2) 28-layer weight-stream timing at T tokens per step.
-Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/kernels/bench_talker_dense.py --T 32 64 128
+Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/bench/bench_talker_dense.py --T 32 64 128
 """
 import argparse, sys, time
 from pathlib import Path
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parents[1] / "kernels"))
 sys.path.insert(0, str(Path(__file__).parents[1] / "proto"))
 from cp_graph import MODEL  # noqa: E402
 from cp_step_graph import rms  # noqa: E402

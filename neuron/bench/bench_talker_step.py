@@ -1,14 +1,14 @@
 """Time the fused Talker step (28 layers, mixed decode + prefill, paged KV) on a serving-like batch.
 
 Random caches/inputs (timing only; correctness is test_talker_step.py). Contexts uniform in [1, max_ctx).
-Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/kernels/bench_talker_step.py --decode 32 --prefill 64 --max-ctx 512
+Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/bench/bench_talker_step.py --decode 32 --prefill 64 --max-ctx 512
 """
 import argparse, sys, time
 from pathlib import Path
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parents[1] / "kernels"))
 sys.path.insert(0, str(Path(__file__).parents[1] / "proto"))
 from cp_graph import MODEL  # noqa: E402
 from nari_qwen3_tts.config import ModelAssetConfig  # noqa: E402

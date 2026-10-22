@@ -1,13 +1,13 @@
 """End-to-end codec decoder: NKI hybrid vs upstream fp32 (CPU) on golden codes; timing per chunk.
 
-Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/kernels/test_codec_decoder.py --rows 32 --frames 16
+Usage: NEURON_RT_VISIBLE_CORES=1 python neuron/tests/test_codec_decoder.py --rows 32 --frames 16
 """
 import argparse, sys, time
 from pathlib import Path
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parents[1] / "kernels"))
 sys.path.insert(0, str(Path(__file__).parents[1] / "proto"))
 from codec_decoder import NeuronCodecDecoder, stage_breakdown  # noqa: E402
 from cp_graph import MODEL  # noqa: E402
