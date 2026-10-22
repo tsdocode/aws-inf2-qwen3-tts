@@ -34,7 +34,7 @@ from prompt import CODEC_EOS, TTS_PAD, build_prompt  # noqa: E402
 from talker_kernels import PAGE, build_group_metadata, kv_write_indices, rope_tables, talker_params, talker_step  # noqa: E402
 
 PREFILL_TOKENS = 64
-PREFILL_SEG_BUCKETS = (1, 4)      # prefill segments per step (static variants); burst arrivals admit up to 4
+PREFILL_SEG_BUCKETS = (1, 4)      # prefill segments per step; 7 (T=480) overflows SBUF in the MLP (needs token-chunked MLP)
 PPS_BUCKETS = (2, 4, 8)            # pages per segment (256 / 512 / 1024 tokens of context)
 MAX_CTX = PPS_BUCKETS[-1] * PAGE
 
@@ -152,6 +152,8 @@ class NeuronTTSEngine:
         self.mix_prefill = mix_prefill
         self.profile = profile
         self.codec_every = codec_every
+        self.slow_step_ms = 300.0
+        self._step_phases = []
         self.phase_ms = {}
         self.gen = torch.Generator().manual_seed(seed)
         t0 = time.perf_counter()
@@ -249,7 +251,19 @@ class NeuronTTSEngine:
                             offs0=o0.to(d), mask0=m0.to(d), **extra, groups=tuple(groups), eps=self.eps)
                 torch.neuron.synchronize()
                 self.log(f"  warmup talker pps={pps} prefill segments={npb}: {time.perf_counter() - t0:.0f}s")
-        self.submit("Warm up.", "ryan", "english", sampling=Sampling(max_new_tokens=4))
+        # End to end with bursts of 1..4 simultaneous requests: eager ops (codec_head, index_select, ...) compile per
+        # distinct token count T = S + n_prefill_segments * 64, and an uncompiled shape stalls every stream for
+        # seconds the first time it appears under traffic.
+        for burst in (1, 2, 4):
+            for _ in range(burst):
+                self.submit("Warm up the engine.", "ryan", "english", sampling=Sampling(max_new_tokens=6))
+            while self.step():
+                pass
+        # ...and once at full scale (every slot busy, staggered lengths), so every first-use path — codec chunks with
+        # all rows live, fresh-row resets, long-context page buckets — runs before the first real request.
+        for i in range(self.S):
+            self.submit("This is a full scale warm up of every slot in the engine.", "ryan", "english",
+                        sampling=Sampling(max_new_tokens=8 + (i % 8)))
         while self.step():
             pass
         self.stats = {"steps": 0, "step_ms": []}
@@ -260,12 +274,15 @@ class NeuronTTSEngine:
         return [s for s in self.slots if s is not None]
 
     def _mark(self, name, t0):
-        """Profiling only: sync the device and attribute elapsed wall time to a phase."""
-        if not self.profile:
-            return t0
-        torch.neuron.synchronize()
+        """Attribute elapsed wall time to a phase (device-synced only when profiling; otherwise host-side time, which
+        includes any blocking D2H). Kept per step so slow steps can be explained in the log."""
+        if self.profile:
+            torch.neuron.synchronize()
         now = time.perf_counter()
-        self.phase_ms.setdefault(name, []).append((now - t0) * 1e3)
+        ms = (now - t0) * 1e3
+        self._step_phases.append((name, ms))
+        if self.profile:
+            self.phase_ms.setdefault(name, []).append(ms)
         return now
 
     # ----------------------------------------------------------------------------------------------------- step
@@ -273,6 +290,7 @@ class NeuronTTSEngine:
     def step(self):
         t_step = time.perf_counter()
         tp = t_step
+        self._step_phases = []
         decoders = [s for s in self.active() if not s.done]
         pres = []
         while self.waiting and any(x is None for x in self.slots) and len(pres) < PREFILL_SEG_BUCKETS[-1]:
@@ -426,7 +444,12 @@ class NeuronTTSEngine:
                     s.sink(None)
                 self._release(s)
         self.stats["steps"] += 1
-        self.stats["step_ms"].append((time.perf_counter() - t_step) * 1e3)
+        step_ms = (time.perf_counter() - t_step) * 1e3
+        self.stats["step_ms"].append(step_ms)
+        if step_ms > self.slow_step_ms:
+            n_dec = len([s for s in self.active() if not s.done])
+            self.log(f"[{self.device}] SLOW STEP {step_ms:.0f} ms (step {self.stats['steps']}, active {n_dec}, "
+                     f"prefills {len(pres)}): " + ", ".join(f"{n} {m:.0f}" for n, m in self._step_phases))
         return True
 
     def _reset_codec_row(self, row):

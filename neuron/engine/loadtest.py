@@ -42,7 +42,7 @@ async def one(client, url, voice, lang, text, results):
             got += len(chunk)
     t1 = time.perf_counter()
     audio_s = got / BYTES_PER_S
-    results.append({"ttfa": (first - t0) * 1e3 if first else None, "audio_s": audio_s, "wall_s": t1 - t0,
+    results.append({"t_start": t0, "ttfa": (first - t0) * 1e3 if first else None, "audio_s": audio_s, "wall_s": t1 - t0,
                     "rtf": (t1 - t0) / max(audio_s, 1e-6), "underrun_s": underrun})
 
 
@@ -70,6 +70,12 @@ async def main_async(a):
           f"audio {audio:.0f}s -> {audio / wall:.1f}x real time aggregate")
     print(f"TTFA ms: p50 {np.percentile(ttfa, 50):.0f} | p90 {np.percentile(ttfa, 90):.0f} | "
           f"p95 {np.percentile(ttfa, 95):.0f} | p99 {np.percentile(ttfa, 99):.0f} | max {ttfa.max():.0f}")
+    t_first_wave_end = min(r["t_start"] for r in ok) + a.warm_window
+    steady = np.array([r["ttfa"] for r in ok if r["t_start"] > t_first_wave_end])
+    if len(steady):
+        print(f"steady-state TTFA ms (requests sent after the first {a.warm_window:.0f}s, n={len(steady)}): "
+              f"p50 {np.percentile(steady, 50):.0f} | p90 {np.percentile(steady, 90):.0f} | p95 {np.percentile(steady, 95):.0f} | "
+              f"p99 {np.percentile(steady, 99):.0f} | max {steady.max():.0f}")
     print(f"playback stalls: {np.mean(under > 0.05) * 100:.1f}% of requests stalled > 50 ms; "
           f"mean stall {under.mean() * 1e3:.0f} ms; RTF p50 {np.median([r['rtf'] for r in ok]):.2f}")
 
@@ -79,6 +85,7 @@ def main():
     ap.add_argument("--url", default="http://127.0.0.1:8000")
     ap.add_argument("--concurrency", type=int, default=64)
     ap.add_argument("--duration", type=float, default=120)
+    ap.add_argument("--warm-window", type=float, default=10, help="seconds counted as the start-up wave")
     asyncio.run(main_async(ap.parse_args()))
 
 

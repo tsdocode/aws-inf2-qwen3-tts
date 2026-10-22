@@ -311,6 +311,21 @@ English, 6 prompt texts (~2-6 s audio each), 90 s runs, 0 errors in all runs:
   less host Python per step (vectorized sampling/metadata), CP whole-frame kernel with in-kernel sampling (-31
   launches/frame), NKI for the codec pre/post (~8 ms/call), talker attention tuning.
 
+### Tail-latency fix (validated on fresh servers, 0 slow steps / 0 recompiles under load)
+Root cause of the multi-second p95/p99: the serving thread called torch.set_num_threads(1); dynamo guards on that
+global, so every compiled graph recompiled on its first serving step (~2.5 s stall for every stream in flight).
+Fix: set it once before warm-up. Plus full-scale end-to-end warm-up, free-slot routing, slow-step logging.
+
+| setup | TTFA all p50/p90/p95/p99 (ms) | steady-state p50/p90/p95/p99/max | RTF |
+|---|---|---|---|
+| 1 core, 32 streams, before | 319 / 494 / 3056 / 3647 | — | 1.01 |
+| 1 core, 32 streams, after | 315 / 348 / 361 / 995 | 314 / 342 / 347 / 355 / 366 | 0.99 |
+| 2 cores, 64 streams, after | 381 / 434 / 459 / 1136 | 379 / 419 / 433 / 458 / 466 | **1.20** |
+
+Remaining: (1) first-wave p99 ~1.1 s (all clients start at once; 4 prefills/step) -> 8 prefills/step needs
+token-chunked talker linears + fused SwiGLU (written, untested); (2) RTF 1.20 at 64 streams (step p50 84 ms,
+p90 136 ms per engine) -> one process per core, less host Python, CP whole-frame kernel, NKI codec pre/post.
+
 ### Running total per frame-batch (B=32 per core)
 talker 29.6 (compiled) + CP 32.1 (compiled) + codec 9.4 (NKI) = 71.1 ms →
 talker 29.6 (compiled) + CP 12.6 (NKI) + codec 9.4 (NKI) = 51.6 ms →

@@ -17,6 +17,7 @@ import nki.language as nl
 import torch
 
 from cp_kernels import _add_residual, _linear, _rmsnorm
+from decode_linear import N_BLOCK
 from decode_linear import P, tile_weight
 
 HEAD_DIM = 128
@@ -42,6 +43,15 @@ def rope_tables(positions, theta):
     return ang.cos().float().contiguous(), ang.sin().float().contiguous()
 
 
+def interleave_gate_up(w, half=512):
+    """[gate (I rows); up (I rows)] -> [gate 0:512; up 0:512; gate 512:1024; up 512:1024; ...], so every 1024-column
+    weight block (tile_weight) yields 4 gate tiles and the 4 matching up tiles: SwiGLU runs straight out of PSUM and the
+    [2*I, T] gate/up intermediate is never materialized (it overflowed SBUF beyond ~4 prefill segments)."""
+    I = w.shape[0] // 2
+    g, u = w[:I], w[I:]
+    return torch.cat([torch.cat([g[j:j + half], u[j:j + half]]) for j in range(0, I, half)])
+
+
 def talker_params(talker, layers=None):
     """Stacked tiled bf16 weights + norm vectors for the Talker layers (host side)."""
     sel = talker.model.layers if layers is None else talker.model.layers[:layers]
@@ -56,7 +66,7 @@ def talker_params(talker, layers=None):
         out["k_rot"].append(rotate_half_norm_matrix(a.k_norm.weight))
         out["o"].append(tile_weight(a.o_proj.weight.detach().to(torch.bfloat16)))
         out["ln2"].append(layer.post_attention_layernorm.weight.detach().float().reshape(-1, 1))
-        out["gate_up"].append(tile_weight(layer.mlp.gate_up_proj.weight.detach().to(torch.bfloat16)))
+        out["gate_up"].append(tile_weight(interleave_gate_up(layer.mlp.gate_up_proj.weight.detach().to(torch.bfloat16))))
         out["down"].append(tile_weight(layer.mlp.down_proj.weight.detach().to(torch.bfloat16)))
     stacked = {k: torch.stack(v).contiguous() for k, v in out.items()}
     stacked["final_norm"] = talker.model.norm.weight.detach().float().reshape(-1, 1).contiguous()
@@ -64,12 +74,88 @@ def talker_params(talker, layers=None):
     return stacked
 
 
+TC = 512  # token chunk: matmul moving free size / one fp32 PSUM bank
+
+
+def _tchunks(T):
+    return [(t0, min(TC, T - t0)) for t0 in range(0, T, TC)]
+
+
+def _rmsnorm_tc(x, w_hbm, KT, T, eps, ones_f32):
+    """``cp_kernels._rmsnorm`` for any T (sum of squares accumulated per <=512-token chunk)."""
+    w = nl.ndarray((P, KT, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=w, src=w_hbm.reshape((KT, P, 1)).permute((1, 0, 2)))
+    inv = nl.ndarray((P, T), dtype=nl.float32, buffer=nl.sbuf)
+    for t0, tn in _tchunks(T):
+        sum_sq = nl.ndarray((P, tn), dtype=nl.float32, buffer=nl.psum)
+        for k in nl.static_range(KT):
+            sq = nl.ndarray((P, tn), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.activation(dst=sq, op=nl.square, data=x[:, k, t0:t0 + tn])
+            nisa.nc_matmul(dst=sum_sq, stationary=ones_f32, moving=sq, accumulate=(k > 0))
+        nisa.activation(dst=inv[:, t0:t0 + tn], op=nl.rsqrt, data=sum_sq, scale=1.0 / (KT * P), bias=eps)
+    out = nl.ndarray((P, KT, T), dtype=nl.bfloat16, buffer=nl.sbuf)
+    for k in nl.static_range(KT):
+        t = nl.ndarray((P, T), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=t, data1=x[:, k, :], data2=inv, op=nl.multiply)
+        nisa.tensor_scalar(dst=out[:, k, :], data=t, op0=nl.multiply, operand0=w[:, k, :])
+    return out
+
+
+def _linear_tc(xn, KT, w_tiled, T, out_dtype):
+    """``cp_kernels._linear`` for any T: each weight block is DMA'd once and reused for every token chunk."""
+    NB = w_tiled.shape[0]
+    NT = NB * (N_BLOCK // P)
+    out = nl.ndarray((P, NT, T), dtype=out_dtype, buffer=nl.sbuf)
+    for nb in nl.static_range(NB):
+        w_blk = nl.ndarray((P, KT, N_BLOCK), dtype=w_tiled.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=w_blk, src=w_tiled[nb])
+        for j in nl.static_range(N_BLOCK // P):
+            for t0, tn in _tchunks(T):
+                acc = nl.ndarray((P, tn), dtype=nl.float32, buffer=nl.psum)
+                for k in nl.static_range(KT):
+                    nisa.nc_matmul(dst=acc, stationary=w_blk[:, k, j * P:(j + 1) * P], moving=xn[:, k, t0:t0 + tn],
+                                   accumulate=(k > 0))
+                nisa.tensor_copy(dst=out[:, nb * (N_BLOCK // P) + j, t0:t0 + tn], src=acc)
+    return out
+
+
+def _swiglu_tc(xn, KT, w_tiled, T):
+    """silu(x @ Wg) * (x @ Wu) for an ``interleave_gate_up`` weight -> [P, I/P, T] bf16, straight out of PSUM."""
+    NB = w_tiled.shape[0]
+    half = N_BLOCK // P // 2                                                 # 4 gate tiles + 4 up tiles per block
+    out = nl.ndarray((P, NB * half, T), dtype=nl.bfloat16, buffer=nl.sbuf)
+    for nb in nl.static_range(NB):
+        w_blk = nl.ndarray((P, KT, N_BLOCK), dtype=w_tiled.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=w_blk, src=w_tiled[nb])
+        for j in nl.static_range(half):
+            for t0, tn in _tchunks(T):
+                g = nl.ndarray((P, tn), dtype=nl.float32, buffer=nl.psum)
+                u = nl.ndarray((P, tn), dtype=nl.float32, buffer=nl.psum)
+                for k in nl.static_range(KT):
+                    nisa.nc_matmul(dst=g, stationary=w_blk[:, k, j * P:(j + 1) * P], moving=xn[:, k, t0:t0 + tn],
+                                   accumulate=(k > 0))
+                for k in nl.static_range(KT):
+                    nisa.nc_matmul(dst=u, stationary=w_blk[:, k, (half + j) * P:(half + j + 1) * P],
+                                   moving=xn[:, k, t0:t0 + tn], accumulate=(k > 0))
+                sg = nl.ndarray((P, tn), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.activation(dst=sg, op=nl.silu, data=g)
+                nisa.tensor_tensor(dst=out[:, nb * half + j, t0:t0 + tn], data1=sg, data2=u, op=nl.multiply)
+    return out
+
+
 # --------------------------------------------------------------------------------------------- kernel side
 def _qk_norm_rope(qk, nheads, T, w_hbm, rot_hbm, cos, sin, eps, ones_f32):
     """qk [P, nheads, T] bf16 (raw projections) -> RoPE(RMSNorm_head(x) * w) bf16 [P, nheads, T]."""
     n = nheads * T
+    if T > TC:   # one head at a time, in token chunks
+        out = nl.ndarray((P, nheads, T), dtype=nl.bfloat16, buffer=nl.sbuf)
+        for h in nl.static_range(nheads):
+            for t0, tn in _tchunks(T):
+                part = _qk_norm_rope(qk[:, h:h + 1, t0:t0 + tn], 1, tn, w_hbm, rot_hbm, cos[:, t0:t0 + tn],
+                                     sin[:, t0:t0 + tn], eps, ones_f32)
+                nisa.tensor_copy(dst=out[:, h, t0:t0 + tn], src=part[:, 0, :])
+        return out
     hc = max(1, 512 // T)      # whole heads per <=512-wide matmul chunk (T need not divide 512)
-    assert T <= 512, T
     sq = nl.ndarray((P, n), dtype=nl.float32, buffer=nl.sbuf)
     nisa.activation(dst=sq, op=nl.square, data=qk.reshape((P, n)))
     inv = nl.ndarray((P, n), dtype=nl.float32, buffer=nl.sbuf)
@@ -124,8 +210,8 @@ def talker_dense_step(xT, cos_hbm, sin_hbm, ln1, qkv, qn_w, kn_w, q_rot, k_rot, 
     nisa.dma_copy(dst=x, src=xT.reshape((KT, P, T)).permute((1, 0, 2)))
 
     for l in nl.static_range(L):
-        hn = _rmsnorm(x, ln1[l], KT, T, eps, ones_f32)
-        qkv_t = _linear(hn, KT, qkv[l], T, nl.bfloat16)                       # [P, 32, T]
+        hn = _rmsnorm_tc(x, ln1[l], KT, T, eps, ones_f32)
+        qkv_t = _linear_tc(hn, KT, qkv[l], T, nl.bfloat16)                       # [P, 32, T]
         q = _qk_norm_rope(qkv_t[:, 0:NH, :], NH, T, qn_w[l], q_rot[l], cos, sin, eps, ones_f32)
         k = _qk_norm_rope(qkv_t[:, NH:nqk, :], KVH, T, kn_w[l], k_rot[l], cos, sin, eps, ones_f32)
         # ---- attention stub: att[h] = v[h // 2] * (1 + 0 * q + 0 * k) keeps q/k live without real attention
@@ -133,19 +219,14 @@ def talker_dense_step(xT, cos_hbm, sin_hbm, ln1, qkv, qn_w, kn_w, q_rot, k_rot, 
         for h in nl.static_range(NH):
             nisa.tensor_tensor(dst=att[:, h, :], data1=qkv_t[:, nqk + h // 2, :], data2=q[:, h, :], op=nl.maximum)
         nisa.tensor_tensor(dst=att[:, 0:KVH, :], data1=att[:, 0:KVH, :], data2=k, op=nl.maximum)
-        attn_out = _linear(att, NH, o[l], T, nl.bfloat16)
+        attn_out = _linear_tc(att, NH, o[l], T, nl.bfloat16)
         x = _add_residual(x, attn_out, KT, T)
-        hn2 = _rmsnorm(x, ln2[l], KT, T, eps, ones_f32)
-        gu = _linear(hn2, KT, gate_up[l], T, nl.bfloat16)                     # [P, 96, T]
-        I_T = gu.shape[1] // 2
-        act = nl.ndarray((P, I_T, T), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.activation(dst=act, op=nl.silu, data=gu[:, 0:I_T, :])
-        hmid = nl.ndarray((P, I_T, T), dtype=nl.bfloat16, buffer=nl.sbuf)
-        nisa.tensor_tensor(dst=hmid, data1=act, data2=gu[:, I_T:2 * I_T, :], op=nl.multiply)
-        mlp_out = _linear(hmid, I_T, down[l], T, nl.bfloat16)
+        hn2 = _rmsnorm_tc(x, ln2[l], KT, T, eps, ones_f32)
+        hmid = _swiglu_tc(hn2, KT, gate_up[l], T)                             # [P, 48, T], no [96, T] buffer
+        mlp_out = _linear_tc(hmid, hmid.shape[1], down[l], T, nl.bfloat16)
         x = _add_residual(x, mlp_out, KT, T)
 
-    xf = _rmsnorm(x, final_norm, KT, T, eps, ones_f32)
+    xf = _rmsnorm_tc(x, final_norm, KT, T, eps, ones_f32)
     hidden = nl.ndarray((H, T), dtype=nl.bfloat16, buffer=nl.shared_hbm)
     nisa.dma_copy(dst=hidden.reshape((KT, P, T)).permute((1, 0, 2)), src=xf)
     return hidden
@@ -409,8 +490,8 @@ def talker_step(xT, cos_hbm, sin_hbm, ln1, qkv, qn_w, kn_w, q_rot, k_rot, o, ln2
     meta = ((offs0, mask0), (offs1, mask1))
 
     for l in nl.static_range(L):
-        hn = _rmsnorm(x, ln1[l], KT, T, eps, ones_f32)
-        qkv_t = _linear(hn, KT, qkv[l], T, nl.bfloat16)                       # [P, 32, T]
+        hn = _rmsnorm_tc(x, ln1[l], KT, T, eps, ones_f32)
+        qkv_t = _linear_tc(hn, KT, qkv[l], T, nl.bfloat16)                       # [P, 32, T]
         q = _qk_norm_rope(qkv_t[:, 0:NH, :], NH, T, qn_w[l], q_rot[l], cos, sin, eps, ones_f32)
         k = _qk_norm_rope(qkv_t[:, NH:nqk, :], KVH, T, kn_w[l], k_rot[l], cos, sin, eps, ones_f32)
         v = qkv_t[:, nqk:nqk + KVH, :]
@@ -429,19 +510,14 @@ def talker_step(xT, cos_hbm, sin_hbm, ln1, qkv, qn_w, kn_w, q_rot, k_rot, o, ln2
             _attend_group(q, att, tok0, nseg, qps, pps, meta[gi][0], meta[gi][1], k_pages, v_pages, ones_bf, ident_f32,
                           seg_chunk, ident_bf=ident_bf, tag=f"{l}_{gi}")
             tok0 += nseg * qps
-        attn_out = _linear(att, NH, o[l], T, nl.bfloat16)
+        attn_out = _linear_tc(att, NH, o[l], T, nl.bfloat16)
         x = _add_residual(x, attn_out, KT, T)
-        hn2 = _rmsnorm(x, ln2[l], KT, T, eps, ones_f32)
-        gu = _linear(hn2, KT, gate_up[l], T, nl.bfloat16)                     # [P, 96, T]
-        I_T = gu.shape[1] // 2
-        act = nl.ndarray((P, I_T, T), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.activation(dst=act, op=nl.silu, data=gu[:, 0:I_T, :])
-        hmid = nl.ndarray((P, I_T, T), dtype=nl.bfloat16, buffer=nl.sbuf)
-        nisa.tensor_tensor(dst=hmid, data1=act, data2=gu[:, I_T:2 * I_T, :], op=nl.multiply)
-        mlp_out = _linear(hmid, I_T, down[l], T, nl.bfloat16)
+        hn2 = _rmsnorm_tc(x, ln2[l], KT, T, eps, ones_f32)
+        hmid = _swiglu_tc(hn2, KT, gate_up[l], T)                             # [P, 48, T], no [96, T] buffer
+        mlp_out = _linear_tc(hmid, hmid.shape[1], down[l], T, nl.bfloat16)
         x = _add_residual(x, mlp_out, KT, T)
 
-    xf = _rmsnorm(x, final_norm, KT, T, eps, ones_f32)
+    xf = _rmsnorm_tc(x, final_norm, KT, T, eps, ones_f32)
     hidden = nl.ndarray((H, T), dtype=nl.bfloat16, buffer=nl.shared_hbm)
     nisa.dma_copy(dst=hidden.reshape((KT, P, T)).permute((1, 0, 2)), src=xf)
     return hidden

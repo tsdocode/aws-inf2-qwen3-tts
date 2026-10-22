@@ -63,7 +63,8 @@ class EngineWorker:
             self.load -= 1
 
     def _run(self):
-        torch.set_num_threads(1)
+        # NOTE: no torch.set_num_threads here. Dynamo guards on that global: changing it in the serving thread made
+        # every compiled graph recompile on its first serving step (2.5 s stall for all streams in flight).
         while True:
             with self.cv:
                 while not self.engine.waiting and not self.engine.active():
@@ -116,7 +117,9 @@ def build_app(workers):
         def sink(pcm):                                  # called on the engine thread
             loop.call_soon_threadsafe(q.put_nowait, None if pcm is None else to_pcm16(pcm))
 
-        worker = min(workers, key=lambda w: w.load)
+        # route to the engine with the most FREE slots: a request routed to a full engine would wait for a whole
+        # utterance to finish before it can even prefill
+        worker = max(workers, key=lambda w: w.engine.S - w.load)
         try:
             worker.submit(text=text, speaker=req.get("voice", "aiden"), language=req.get("language", "auto"),
                           instruct=req.get("instruct", req.get("instructions", "")) or "", sampling=sampling, sink=sink)
@@ -158,6 +161,7 @@ def main():
     ap.add_argument("--port", type=int, default=8000)
     a = ap.parse_args()
     torch._dynamo.config.automatic_dynamic_shapes = False
+    torch.set_num_threads(1)            # once, BEFORE warm-up: warm-up and serving must see the same global state
     assets = HostAssets(MODEL)
     engines = [NeuronTTSEngine(slots=a.slots, device=f"neuron:{i}", codec_every=a.codec_every, assets=assets,
                                seed=1234 + i) for i in range(a.cores)]
