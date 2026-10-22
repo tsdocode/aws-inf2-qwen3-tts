@@ -190,6 +190,7 @@ def _attend_group(q, att, tok0, nseg, qps, pps, offs_hbm, mask_hbm, k_pages, v_p
     NH, KVH = 16, 8
     lanes = 2 * qps                                            # 2 query heads per KV head x query tokens
     scale = 1.0 / (HEAD_DIM ** 0.5)
+    seg_chunk = max(1, min(seg_chunk, P // lanes))             # the max transpose takes <= 128 lanes per chunk
     if ident_bf is None:
         ident_bf = nl.shared_identity_matrix(n=P, dtype=nl.bfloat16)
     # Padding pages are skipped by the DMA (out-of-bounds id + oob_mode.skip), so their buffer slots keep old
@@ -214,14 +215,12 @@ def _attend_group(q, att, tok0, nseg, qps, pps, offs_hbm, mask_hbm, k_pages, v_p
         kp = kbufs[ci % 2]                                     # [key, page, (g, d)]  token-major like V
         vp = vbufs[ci % 2]                                     # [key, page, (g, d)]
         for i in nl.static_range(npg):
-            nk = None if tag is None else f"kvg_{tag}_{ci}_{i}_k"
-            nv = None if tag is None else f"kvg_{tag}_{ci}_{i}_v"
             nisa.dma_copy(dst=kp[:, i, :], src=k_pages.ap(pattern=[[8 * HEAD_DIM, P], [1, 8 * HEAD_DIM]], offset=0,
                                                           scalar_offset=offs[0:1, i:i + 1], indirect_dim=0),
-                          oob_mode=nisa.oob_mode.skip, name=nk)
+                          oob_mode=nisa.oob_mode.skip)
             nisa.dma_copy(dst=vp[:, i, :], src=v_pages.ap(pattern=[[8 * HEAD_DIM, P], [1, 8 * HEAD_DIM]], offset=0,
                                                           scalar_offset=offs[0:1, i:i + 1], indirect_dim=0),
-                          oob_mode=nisa.oob_mode.skip, name=nv)
+                          oob_mode=nisa.oob_mode.skip)
         kp4 = kp.reshape((P, max_npg, KVH, HEAD_DIM))
         vp4 = vp.reshape((P, max_npg, KVH, HEAD_DIM))
         for g in nl.static_range(KVH):
@@ -374,8 +373,7 @@ def _write_kv(k, v, T, rows_hbm, k_rows, v_rows, ident_bf, tag=""):
                 nisa.nc_matmul(dst=tp, stationary=src[:, h, t0:t0 + tn], moving=ident_bf)
                 nisa.tensor_copy(dst=tok[:, h, :], src=tp)
             nisa.dma_copy(dst=rows.ap(pattern=[[KVH * HEAD_DIM, tn], [1, KVH * HEAD_DIM]], offset=0, vector_offset=idx,
-                                      indirect_dim=0), src=tok.reshape((tn, KVH * HEAD_DIM)), oob_mode=nisa.oob_mode.skip,
-                          name=f"kvw_{tag}_{t0}_{kvn}")
+                                      indirect_dim=0), src=tok.reshape((tn, KVH * HEAD_DIM)), oob_mode=nisa.oob_mode.skip)
 
 
 @nki.jit
@@ -448,20 +446,3 @@ def talker_step(xT, cos_hbm, sin_hbm, ln1, qkv, qn_w, kn_w, q_rot, k_rot, o, ln2
     nisa.dma_copy(dst=hidden.reshape((KT, P, T)).permute((1, 0, 2)), src=xf)
     return hidden
 
-
-def talker_step_scheduled(groups, T, L, seg_chunk=4, do_kv_write=True, do_attention=True):
-    """``talker_step`` with explicit read-after-write edges: every page gather of layer l waits (hardware semaphore)
-    for layer l's K/V scatter writes. The writes and gathers address the cache through runtime offsets, so the
-    compiler cannot see that they alias and may otherwise reorder them -> stale keys (measured: a fresh prefill
-    chunk, whose keys all come from this step's writes, was 13-18% off)."""
-    edges = []
-    if do_kv_write and do_attention:
-        for l in range(L):
-            writes = [f"kvw_{l}_{t0}_{kv}" for t0 in range(0, T, P) for kv in ("k", "v")]
-            for gi, (nseg, qps, pps) in enumerate(groups):
-                for ci, c0 in enumerate(range(0, nseg, seg_chunk)):
-                    npg = min(seg_chunk, nseg - c0) * pps
-                    for i in range(npg):
-                        for kv in ("k", "v"):
-                            edges.append((f"kvg_{l}_{gi}_{ci}_{i}_{kv}", writes))
-    return talker_step.with_schedule(edges, kind=nisa.dependency.runtime) if edges else talker_step

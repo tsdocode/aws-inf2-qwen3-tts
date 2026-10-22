@@ -292,6 +292,25 @@ pure admission queueing (one prefill per step) → next: several prefill segment
 - Codec chunk at B=32: F=1 42.1 -> **30.1 ms**, F=2 36.7 ms (18.4/frame), F=4 67.8 -> 56.9 ms (14.2/frame).
   Remaining compiled pre/post ~8 ms per call.
 
+### Server + load test (`engine/server.py`, `engine/loadtest.py`) — first end-to-end serving numbers
+OpenAI-style streaming /v1/audio/speech; one engine per NeuronCore in one process (shared HostAssets, 5 GB
+host RAM), least-loaded routing; 4 prefill segments/step; codec every 2 steps. Closed-loop streaming clients,
+English, 6 prompt texts (~2-6 s audio each), 90 s runs, 0 errors in all runs:
+
+| setup | aggregate | TTFA p50 / p90 / p95 / p99 (ms) | RTF p50 |
+|---|---|---|---|
+| 1 core, 32 streams | 27.0x | 317 / 359 / 3141 / 3750 | 1.01 (step p50 80 ms, p90 117 ms) |
+| 2 cores, 32 streams | 29.7x | 315 / 355 / 620 / 3680 | 1.01 |
+| 2 cores, 64 streams | 51.8x | **378 / 426 / 567 / 1126** | **1.20** (not real time yet) |
+
+- Per core at 32 streams we sit exactly at the 80 ms budget; two engines in ONE process add ~20% (GIL: 5-8 ms of
+  host Python per step per engine on a 4-vCPU host).
+- Gotchas: NKI kernel tracing is not thread-safe (warm engines up sequentially); eager `t[row] = 0` compiles a new
+  op per row value (use a keep-mask multiply).
+- Next for headroom: one process per core (needs smaller host footprint: drop CPU weight copies after init),
+  less host Python per step (vectorized sampling/metadata), CP whole-frame kernel with in-kernel sampling (-31
+  launches/frame), NKI for the codec pre/post (~8 ms/call), talker attention tuning.
+
 ### Running total per frame-batch (B=32 per core)
 talker 29.6 (compiled) + CP 32.1 (compiled) + codec 9.4 (NKI) = 71.1 ms →
 talker 29.6 (compiled) + CP 12.6 (NKI) + codec 9.4 (NKI) = 51.6 ms →

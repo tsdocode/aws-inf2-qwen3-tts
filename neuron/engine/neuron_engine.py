@@ -12,6 +12,7 @@ Protocol mirrors nari (see engine/prompt.py): EOS blocked for the first 3 sample
 codec_sum(previous frame) + P(trailing text or tts_pad), positions = prefill 0..L-1 then L + t.
 """
 
+import copy
 import json
 import math
 import sys
@@ -33,6 +34,7 @@ from prompt import CODEC_EOS, TTS_PAD, build_prompt  # noqa: E402
 from talker_kernels import PAGE, build_group_metadata, kv_write_indices, rope_tables, talker_params, talker_step  # noqa: E402
 
 PREFILL_TOKENS = 64
+PREFILL_SEG_BUCKETS = (1, 4)      # prefill segments per step (static variants); burst arrivals admit up to 4
 PPS_BUCKETS = (2, 4, 8)            # pages per segment (256 / 512 / 1024 tokens of context)
 MAX_CTX = PPS_BUCKETS[-1] * PAGE
 
@@ -110,13 +112,42 @@ def _sample(logits, temperature, top_k, top_p, greedy, gen):
     return torch.multinomial(torch.softmax(logits, -1), 1, generator=gen).squeeze(-1)
 
 
-class NeuronTTSEngine:
-    def __init__(self, model_dir, slots=32, device="neuron", seed=0, log=print, mix_prefill=True, profile=False,
-                 codec_every=2):
+class HostAssets:
+    """CPU-side model assets, loaded once and shared by every engine (one engine per NeuronCore).
+
+    Two engines each loading their own CPU copies need ~20 GB of host RAM; inf2.xlarge has 16 GB.
+    """
+
+    def __init__(self, model_dir, log=print):
         from nari_qwen3_tts.config import ModelAssetConfig
         from nari_qwen3_tts.model.checkpoint import CheckpointLoader
         from transformers import Qwen2TokenizerFast
 
+        t0 = time.perf_counter()
+        self.cfg = json.load(open(Path(model_dir) / "config.json"))["talker_config"]
+        self.tok = Qwen2TokenizerFast.from_pretrained(model_dir, fix_mistral_regex=True)
+        loader = CheckpointLoader(ModelAssetConfig(model_id=str(model_dir), device="cpu", require_h100=False,
+                                                   local_files_only=True))
+        self.talker = loader.load_talker(device=torch.device("cpu"), dtype=torch.bfloat16).eval()
+        self.predictor, layer0 = loader.load_code_predictor(device=torch.device("cpu"), dtype=torch.bfloat16)
+        self.codec = loader.load_codec(device=torch.device("cpu"), dtype=torch.float32).float().decoder.eval()
+        self.text_emb = self.talker.model.text_embedding.weight.detach()
+        self.text_proj = self.talker.text_projection.eval()
+        self.codec_emb = self.talker.model.codec_embedding.weight.detach()            # talker codec emb (group 0)
+        with torch.no_grad():
+            proj = self.predictor.small_to_mtp_projection
+            self.res_emb = torch.stack([e.weight.detach() for e in self.predictor.model.codec_embedding])  # [15,2048,2048]
+            self.proj_l0 = proj(layer0.weight).detach()                                 # [3072, 1024]
+            self.proj_res = torch.stack([proj(e.weight) for e in self.predictor.model.codec_embedding[:-1]]).detach()
+        self.talker_params = talker_params(self.talker)
+        self.cp_params = cp_step_params(self.predictor)
+        self.p_cache = {}
+        log(f"host assets loaded in {time.perf_counter() - t0:.0f}s")
+
+
+class NeuronTTSEngine:
+    def __init__(self, model_dir=None, slots=32, device="neuron", seed=0, log=print, mix_prefill=True, profile=False,
+                 codec_every=2, assets=None):
         self.log, self.device, self.S = log, device, slots
         self.mix_prefill = mix_prefill
         self.profile = profile
@@ -124,52 +155,40 @@ class NeuronTTSEngine:
         self.phase_ms = {}
         self.gen = torch.Generator().manual_seed(seed)
         t0 = time.perf_counter()
-        self.cfg = json.load(open(Path(model_dir) / "config.json"))["talker_config"]
-        self.tok = Qwen2TokenizerFast.from_pretrained(model_dir, fix_mistral_regex=True)
-        loader = CheckpointLoader(ModelAssetConfig(model_id=str(model_dir), device="cpu", require_h100=False,
-                                                   local_files_only=True))
-        talker = loader.load_talker(device=torch.device("cpu"), dtype=torch.bfloat16).eval()
-        predictor, layer0 = loader.load_code_predictor(device=torch.device("cpu"), dtype=torch.bfloat16)
-        codec = loader.load_codec(device=torch.device("cpu"), dtype=torch.float32).float().decoder.eval()
+        A = assets or HostAssets(model_dir, log)
+        self.cfg, self.tok = A.cfg, A.tok
 
-        # ---- host tables
-        self.text_emb = talker.model.text_embedding.weight.detach()
-        self.text_proj = talker.text_projection.eval()
-        self._p_cache = {}
-        self.codec_emb = talker.model.codec_embedding.weight.detach()                  # talker codec emb (group 0)
-        with torch.no_grad():
-            proj = predictor.small_to_mtp_projection
-            self.res_emb = torch.stack([e.weight.detach() for e in predictor.model.codec_embedding])  # [15, 2048, 2048]
-            self.proj_l0 = proj(layer0.weight).detach()                                 # [3072, 1024]
-            self.proj_res = torch.stack([proj(e.weight) for e in predictor.model.codec_embedding[:-1]]).detach()
-        self.small_proj = predictor.small_to_mtp_projection.to(device)
+        # ---- host tables (shared)
+        self.text_emb, self.text_proj, self._p_cache = A.text_emb, A.text_proj, A.p_cache
+        self.codec_emb, self.res_emb, self.proj_l0, self.proj_res = A.codec_emb, A.res_emb, A.proj_l0, A.proj_res
+        # ---- small modules: per-engine device copies (``.to(device)`` moves modules in place)
+        self.small_proj = copy.deepcopy(A.predictor.small_to_mtp_projection).to(device)
         self.proj_l0_dev = self.proj_l0.to(device)
         self.proj_res_dev = torch.cat([self.proj_res, torch.zeros_like(self.proj_res[:1])]).contiguous().to(device)
         self.sampler = torch.compile(_DeviceSampler(50), backend="neuron", fullgraph=True)
-        self.codec_head = talker.codec_head.to(device)
+        self.codec_head = copy.deepcopy(A.talker.codec_head).to(device)
         suppress = torch.zeros(self.cfg["vocab_size"], dtype=torch.bool)
         suppress[2048:] = True
         suppress[CODEC_EOS] = False
         self.suppress = suppress
 
         # ---- device weights / kernels
-        tp = talker_params(talker)
+        tp = dict(A.talker_params)
         self.eps = tp.pop("eps")
-        self.theta = talker.model.layers[0].self_attn.rope_theta
+        self.theta = A.talker.model.layers[0].self_attn.rope_theta
         self.tw = {k: v.to(device) for k, v in tp.items()}
-        cp = cp_step_params(predictor)
+        cp = dict(A.cp_params)
         self.cp_eps = cp.pop("eps")
         self.cp_rope = cp.pop("rope").to(device)
         self.cp_heads = cp.pop("lm_heads").to(device)
         self.cpw = {k: v.to(device) for k, v in cp.items()}
-        self.L = len(talker.model.layers)
+        self.L = len(A.talker.model.layers)
         self.nblk = slots * PPS_BUCKETS[-1] + 8
         self.k_cache = torch.zeros(self.L, self.nblk, PAGE, 8, 128, dtype=torch.bfloat16).to(device)
         self.v_cache = torch.zeros(self.L, self.nblk, PAGE, 8, 128, dtype=torch.bfloat16).to(device)
         self.free_blocks = deque(range(self.nblk))
-        self.cp_kv = torch.zeros(len(predictor.model.layers), 2, 128, CP_STEPS, 8, slots, dtype=torch.bfloat16).to(device)
-        self.codec = StreamingCodecDecoder(codec, batch=slots, device=device)
-        del talker, predictor, codec
+        self.cp_kv = torch.zeros(len(A.predictor.model.layers), 2, 128, CP_STEPS, 8, slots, dtype=torch.bfloat16).to(device)
+        self.codec = StreamingCodecDecoder(copy.deepcopy(A.codec), batch=slots, device=device)
 
         self.waiting, self.slots = deque(), [None] * slots
         self.next_rid = 0
@@ -215,20 +234,21 @@ class NeuronTTSEngine:
         t0 = time.perf_counter()
         S, d, oob = self.S, self.device, self.nblk * self.L
         for pps in PPS_BUCKETS:
-            for with_pre in (False, True):
-                T = S + (PREFILL_TOKENS if with_pre else 0)
-                groups = [(S, 1, pps)] + ([(1, PREFILL_TOKENS, pps)] if with_pre else [])
+            for npb in (0,) + PREFILL_SEG_BUCKETS:
+                with_pre = npb > 0
+                T = S + npb * PREFILL_TOKENS
+                groups = [(S, 1, pps)] + ([(npb, PREFILL_TOKENS, pps)] if with_pre else [])
                 o0, m0 = build_group_metadata([([], -1, 1)] * S, 1, pps, oob)
                 extra = {}
                 if with_pre:
-                    o1, m1 = build_group_metadata([([], -1, PREFILL_TOKENS)], PREFILL_TOKENS, pps, oob)
+                    o1, m1 = build_group_metadata([([], 0, 0)] * npb, PREFILL_TOKENS, pps, oob)
                     extra = dict(offs1=o1.to(d), mask1=m1.to(d))
                 cos, sin = rope_tables(torch.zeros(T, dtype=torch.long), self.theta)
                 talker_step(torch.zeros(2048, T, dtype=torch.bfloat16).to(d), cos.to(d), sin.to(d), **self.tw,
                             k_cache=self.k_cache, v_cache=self.v_cache, rows_hbm=kv_write_indices([-1] * T, [0] * T, oob).to(d),
                             offs0=o0.to(d), mask0=m0.to(d), **extra, groups=tuple(groups), eps=self.eps)
                 torch.neuron.synchronize()
-                self.log(f"  warmup talker pps={pps} prefill={with_pre}: {time.perf_counter() - t0:.0f}s")
+                self.log(f"  warmup talker pps={pps} prefill segments={npb}: {time.perf_counter() - t0:.0f}s")
         self.submit("Warm up.", "ryan", "english", sampling=Sampling(max_new_tokens=4))
         while self.step():
             pass
@@ -254,15 +274,16 @@ class NeuronTTSEngine:
         t_step = time.perf_counter()
         tp = t_step
         decoders = [s for s in self.active() if not s.done]
-        pre = None
-        if self.waiting and any(x is None for x in self.slots):
+        pres = []
+        while self.waiting and any(x is None for x in self.slots) and len(pres) < PREFILL_SEG_BUCKETS[-1]:
             pre = self.waiting.popleft()
             pre.slot = self.slots.index(None)
             self.slots[pre.slot] = pre
             self._reset_codec_row(pre.slot)
-            if not self.mix_prefill:
-                decoders = []                                   # debug: prefill-only step (no mixed batch)
-        if not decoders and pre is None and not self.active():
+            pres.append(pre)
+        if pres and not self.mix_prefill:
+            decoders = []                                       # debug: prefill-only step (no mixed batch)
+        if not decoders and not pres and not self.active():
             return False
 
         # ---- talker token batch: decode slots (static S rows) + optional prefill chunk
@@ -279,29 +300,40 @@ class NeuronTTSEngine:
             wblk[s.slot], woff[s.slot] = s.blocks[s.ctx // PAGE], s.ctx % PAGE
             dec_meta[s.slot] = (s.blocks, s.ctx, 1)
         groups = []
-        max_ctx = max([s.ctx + 1 for s in decoders] + [1])
-        if pre is not None:
-            L_ = len(pre.prompt.text_ids)
-            self._alloc(pre, L_)
-            emb = self.P(pre.prompt.text_ids).clone()
-            m = torch.tensor(pre.prompt.codec_mask)
-            emb[m] += self.codec_emb[torch.tensor(pre.prompt.codec_ids)[m]]
-            px = torch.zeros(PREFILL_TOKENS, 2048, dtype=torch.bfloat16)
-            px[:L_] = emb
+        max_ctx = max([s.ctx + 1 for s in decoders] + [len(p.prompt.text_ids) for p in pres] + [1])
+        npb = next(b for b in PREFILL_SEG_BUCKETS if b >= len(pres)) if pres else 0
+        pre_rows, pre_meta = [], []
+        if pres:
+            px = torch.zeros(npb * PREFILL_TOKENS, 2048, dtype=torch.bfloat16)
+            for i in range(npb):
+                base = i * PREFILL_TOKENS
+                if i >= len(pres):                                             # padding segment: no queries
+                    wblk += [-1] * PREFILL_TOKENS
+                    woff += [0] * PREFILL_TOKENS
+                    pre_meta.append(([], 0, 0))
+                    continue
+                pre = pres[i]
+                L_ = len(pre.prompt.text_ids)
+                self._alloc(pre, L_)
+                emb = self.P(pre.prompt.text_ids).clone()
+                m = torch.tensor(pre.prompt.codec_mask)
+                emb[m] += self.codec_emb[torch.tensor(pre.prompt.codec_ids)[m]]
+                px[base:base + L_] = emb
+                wblk += [pre.blocks[t // PAGE] for t in range(L_)] + [-1] * (PREFILL_TOKENS - L_)
+                woff += [t % PAGE for t in range(L_)] + [0] * (PREFILL_TOKENS - L_)
+                pre_meta.append((pre.blocks, 0, L_))
+                pre_rows.append(S + base + L_ - 1)
             xs = torch.cat([xs, px])
-            pos = torch.cat([pos, torch.arange(PREFILL_TOKENS)])
-            wblk += [pre.blocks[t // PAGE] for t in range(L_)] + [-1] * (PREFILL_TOKENS - L_)
-            woff += [t % PAGE for t in range(L_)] + [0] * (PREFILL_TOKENS - L_)
-            max_ctx = max(max_ctx, L_)
+            pos = torch.cat([pos, torch.arange(PREFILL_TOKENS).repeat(npb)])
         pps = next(b for b in PPS_BUCKETS if b * PAGE >= max_ctx)
         oob = self.nblk * self.L               # out of range for the WHOLE stacked cache, not just one layer's view
         offs0, mask0 = build_group_metadata(dec_meta, 1, pps, oob)
         groups.append((S, 1, pps))
         extra = {}
-        if pre is not None:
-            # prefill queries j >= L_ are padding: give them no visible keys
-            offs1, mask1 = build_group_metadata([(pre.blocks, 0, L_)], PREFILL_TOKENS, pps, oob)
-            groups.append((1, PREFILL_TOKENS, pps))
+        if pres:
+            # prefill queries j >= L_ (and padding segments) are padding: give them no visible keys
+            offs1, mask1 = build_group_metadata(pre_meta, PREFILL_TOKENS, pps, oob)
+            groups.append((npb, PREFILL_TOKENS, pps))
             extra = dict(offs1=offs1.to(self.device), mask1=mask1.to(self.device))
         rows = kv_write_indices(wblk, woff, oob)
         cos, sin = rope_tables(pos, self.theta)
@@ -312,15 +344,15 @@ class NeuronTTSEngine:
                              groups=tuple(groups), eps=self.eps)           # [2048, T]
         tp = self._mark("talker step (NKI)", tp)
         hT = hidden.t()                                                       # [T, 2048] device
-        sel = [s.slot for s in decoders] + ([S + L_ - 1] if pre is not None else [])
-        owners = decoders + ([pre] if pre is not None else [])
+        sel = [s.slot for s in decoders] + pre_rows
+        owners = decoders + pres
         logits = self.codec_head(hT).float().cpu()                            # [T, 3072]
         tp = self._mark("codec_head + D2H", tp)
         for s in decoders:
             s.ctx += 1
             s.step += 1
-        if pre is not None:
-            pre.ctx = L_
+        for pre in pres:
+            pre.ctx = len(pre.prompt.text_ids)
 
         # ---- talker sampling
         sampled, cp_rows = {}, []
@@ -398,12 +430,22 @@ class NeuronTTSEngine:
         return True
 
     def _reset_codec_row(self, row):
-        """A new stream starts in ``row``: zero that row of every codec state tensor (KV has batch on dim 1)."""
+        """A new stream starts in ``row``: zero that row of every codec state tensor (KV has batch on dim 1).
+
+        Done as a multiply by a keep-mask *tensor*: an eager ``t[row] = 0`` bakes the Python int into the compiled op,
+        so every distinct row value triggered fresh Neuron compiles mid-traffic.
+        """
+        keep = torch.ones(self.S)
+        keep[row] = 0.0
+        keep_d = keep.to(self.device)
         for k, t in self.codec.state.items():
-            if k in ("tf_k", "tf_v", "fk", "fv"):
-                t[:, row] = 0
-            else:
+            if t.device.type == "cpu":
                 t[row] = 0
+                continue
+            shape = [1] * t.dim()
+            bdim = 1 if k in ("tf_k", "tf_v", "fk", "fv") else 0
+            shape[bdim] = self.S
+            t.mul_(keep_d.to(t.dtype).view(shape))
 
     def _code_predictor_device(self, rows, sampled, hT):
         """16 fused NKI depth steps with on-device sampling: one H2D (uniforms) and one D2H (16 tokens) per frame."""
