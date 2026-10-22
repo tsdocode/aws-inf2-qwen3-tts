@@ -31,6 +31,14 @@ def main():
         torch.neuron.synchronize()
         st = neu.state
         rows, n = [], 10
+        if neu.nki_front:                     # full-chunk timing only (stage breakdown is for the compiled front)
+            t0 = time.perf_counter()
+            for _ in range(n):
+                neu(codes)
+            torch.neuron.synchronize()
+            full = (time.perf_counter() - t0) / n * 1e3
+            print(f"B={a.rows} F={F} (NKI front): full chunk {full:.1f} ms ({full / F:.1f} ms per frame)")
+            continue
 
         def timed(name, fn):
             out = fn()

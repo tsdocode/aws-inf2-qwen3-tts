@@ -282,6 +282,16 @@ codec every K steps, K frames per row (rows with < K pending: fresh -> state res
 68 ms average (16.3x RT aggregate)** → real time at 32 streams per core. Burst TTFA (32 at t=0) p50 1.7 s is
 pure admission queueing (one prefill per step) → next: several prefill segments per step.
 
+### NKI codec front transformer (option B, `kernels/codec_front_kernels.py`)
+- 8-layer sliding-window transformer (16 heads x 64) as one kernel; head PAIRS share a 128-partition tile and
+  a block-diagonal ones matmul reduces each 64-row half -> both heads' scores at once, matmul-free attention,
+  no transposes. K/V state per (row, pair) [128, 71] D-major, new state = last 71 of [prior|new] (static DMA).
+  The 12 Hz codec has q_norm/k_norm = Identity (RoPE only).
+- vs exact CPU streaming reference, 3 chunks (F=1,4,4): hidden 2e-3 rel L2, K state 2.8e-3. Streaming audio
+  vs upstream fp32 whole sequence: 47.6 dB (fp32 compiled front: 52.5; plain bf16 front: 42).
+- Codec chunk at B=32: F=1 42.1 -> **30.1 ms**, F=2 36.7 ms (18.4/frame), F=4 67.8 -> 56.9 ms (14.2/frame).
+  Remaining compiled pre/post ~8 ms per call.
+
 ### Running total per frame-batch (B=32 per core)
 talker 29.6 (compiled) + CP 32.1 (compiled) + codec 9.4 (NKI) = 71.1 ms →
 talker 29.6 (compiled) + CP 12.6 (NKI) + codec 9.4 (NKI) = 51.6 ms →

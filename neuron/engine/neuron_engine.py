@@ -400,7 +400,7 @@ class NeuronTTSEngine:
     def _reset_codec_row(self, row):
         """A new stream starts in ``row``: zero that row of every codec state tensor (KV has batch on dim 1)."""
         for k, t in self.codec.state.items():
-            if k in ("tf_k", "tf_v"):
+            if k in ("tf_k", "tf_v", "fk", "fv"):
                 t[:, row] = 0
             else:
                 t[row] = 0

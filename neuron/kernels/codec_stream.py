@@ -15,6 +15,7 @@ import torch._dynamo
 import torch.nn as nn
 import torch.nn.functional as F
 
+from codec_front_kernels import front_attention_mask, front_rope_tables, front_transformer, front_transformer_params
 from codec_kernels import (residual_unit, residual_unit_params, snake_conv_out, snake_conv_out_params,
                            snake_transconv, snake_transconv_params)
 
@@ -61,9 +62,10 @@ def _transconv_kernel_eq_stride(module, x):
 
 
 class StreamingFront(nn.Module):
-    def __init__(self, decoder):
+    def __init__(self, decoder, skip_transformer=False):
         super().__init__()
         self.d = decoder
+        self.skip_transformer = skip_transformer      # timing experiments only
         tf = decoder.pre_transformer
         self.window = int(tf.config.sliding_window)
         self.retained = max(0, self.window - 1)
@@ -107,7 +109,7 @@ class StreamingFront(nn.Module):
         kp = key_pos.unsqueeze(1)
         mask = (valid.unsqueeze(1) & (kp <= qp) & (kp > qp - self.window)).unsqueeze(1)
         new_k, new_v = [], []
-        for li, layer in enumerate(tf.layers):
+        for li, layer in enumerate([] if self.skip_transformer else tf.layers):
             res = hidden                                                                       # [B*F, D]
             n = layer.input_layernorm(hidden)
             att = layer.self_attn
@@ -140,16 +142,67 @@ class StreamingFront(nn.Module):
             h = cn.pwconv2(cn.act(cn.pwconv1(cn.norm(h.permute(0, 2, 1).reshape(B * Tn, -1)))))   # 2-D: one GEMM
             hidden = r + (cn.gamma * h).view(B, Tn, -1).permute(0, 2, 1)
         hidden, dec0 = _causal_conv_step(d.decoder[0], hidden, dec0)
+        if self.skip_transformer:
+            new_k, new_v = list(tf_k), list(tf_v)
         return (hidden.contiguous(), pos + Fr, torch.clamp(ctx + Fr, max=R), pre, torch.stack(new_k), torch.stack(new_v),
                 cnx[0], cnx[1], dec0)
+
+
+class _FrontPre(nn.Module):
+    """quantizer.decode -> pre_conv (hist) -> input_proj, output transposed for the NKI transformer: [512, B*F]."""
+
+    def __init__(self, decoder):
+        super().__init__()
+        self.d = decoder
+
+    def forward(self, codes, pre):
+        d = self.d
+        hidden = d.quantizer.decode(codes)
+        hidden, pre = _causal_conv_step(d.pre_conv, hidden, pre)
+        B, Fr = hidden.shape[0], hidden.shape[2]
+        hidden = d.pre_transformer.input_proj(hidden.transpose(1, 2).reshape(B * Fr, -1))
+        return hidden.t().contiguous(), pre
+
+
+class _FrontPost(nn.Module):
+    """output_proj -> 2x [transconv (kernel == stride), ConvNeXt (hist)] -> decoder[0] conv (hist)."""
+
+    def __init__(self, decoder):
+        super().__init__()
+        self.d = decoder
+
+    def forward(self, yT, cnx0, cnx1, dec0):
+        d = self.d
+        B = cnx0.shape[0]
+        hidden = d.pre_transformer.output_proj(yT.t())                                 # [B*F, 1024]
+        Fr = hidden.shape[0] // B
+        hidden = hidden.view(B, Fr, -1).permute(0, 2, 1)
+        cnx = [cnx0, cnx1]
+        for i, blocks in enumerate(d.upsample):
+            hidden = _transconv_kernel_eq_stride(blocks[0], hidden)
+            cn = blocks[1]
+            r = hidden
+            h, cnx[i] = _causal_conv_step(cn.dwconv, hidden, cnx[i])
+            Tn = h.shape[-1]
+            h = cn.pwconv2(cn.act(cn.pwconv1(cn.norm(h.permute(0, 2, 1).reshape(B * Tn, -1)))))
+            hidden = r + (cn.gamma * h).view(B, Tn, -1).permute(0, 2, 1)
+        hidden, dec0 = _causal_conv_step(d.decoder[0], hidden, dec0)
+        return hidden.contiguous(), cnx[0], cnx[1], dec0
 
 
 class StreamingCodecDecoder:
     """B streams decoded in lockstep, chunk by chunk; ``reset_rows`` starts new streams in given rows."""
 
-    def __init__(self, decoder, batch, device="neuron", front_dtype=torch.float32):
+    def __init__(self, decoder, batch, device="neuron", front_dtype=torch.float32, nki_front=True):
         decoder = decoder.float().eval()
         self.front_dtype = front_dtype
+        self.nki_front = nki_front
+        if nki_front:
+            tfp = front_transformer_params(decoder.pre_transformer)
+            self.tf_eps, self.tf_qk_norm = tfp.pop("eps"), tfp.pop("qk_norm")
+            self.tf_params = {k: v.to(device) for k, v in tfp.items()}
+            self.tf_inv_freq = decoder.pre_transformer.rotary_emb.inv_freq.detach().float().cpu()
+            self.tf_layers = len(decoder.pre_transformer.layers)
         self.B, self.device = batch, device
         self.front_mod = StreamingFront(decoder)
         self.blocks = []
@@ -167,6 +220,9 @@ class StreamingCodecDecoder:
         self.tail_params = {k: v.to(device) for k, v in snake_conv_out_params(decoder.decoder[5], decoder.decoder[6]).items()}
         self.tail_c = decoder.decoder[6].conv.in_channels
         decoder.to(device)
+        if nki_front:
+            self.pre = torch.compile(_FrontPre(decoder), backend="neuron", fullgraph=True)
+            self.post = torch.compile(_FrontPost(decoder), backend="neuron", fullgraph=True)
         if front_dtype != torch.float32:
             mod = self.front_mod
 
@@ -181,6 +237,13 @@ class StreamingCodecDecoder:
 
     def _fresh_state(self):
         st = {k: torch.zeros(shape, dtype=dt).to(self.device) for k, (shape, dt) in self.front_mod.state_shapes(self.B).items()}
+        if self.nki_front:
+            del st["tf_k"], st["tf_v"]
+            R = self.front_mod.retained
+            st["fk"] = torch.zeros(self.tf_layers, self.B, 8, 128, R, dtype=torch.bfloat16).to(self.device)
+            st["fv"] = torch.zeros(self.tf_layers, self.B, 8, 128, R, dtype=torch.bfloat16).to(self.device)
+            st["pos"] = torch.zeros(self.B, dtype=torch.long)        # host: RoPE tables + masks are built on the host
+            st["ctx"] = torch.zeros(self.B, dtype=torch.long)
         for i, ((_, _, cin), units) in enumerate(self.blocks):
             st[f"tc{i}"] = torch.zeros(self.B, cin, 1).to(self.device)
             for j, (_, static, c) in enumerate(units):
@@ -188,13 +251,29 @@ class StreamingCodecDecoder:
         st["tail"] = torch.zeros(self.B, self.tail_c, 6).to(self.device)
         return st
 
+    def _front_nki(self, codes):
+        st, d = self.state, self.device
+        Fr = codes.shape[-1]
+        hT, st["pre"] = self.pre(codes, st["pre"])
+        cos, sin = front_rope_tables(st["pos"], Fr, self.tf_inv_freq)
+        mask = front_attention_mask(st["ctx"], Fr, retained=self.front_mod.retained, window=self.front_mod.window)
+        yT, st["fk"], st["fv"] = front_transformer(hT, cos.to(d), sin.to(d), mask.to(d), st["fk"], st["fv"],
+                                                   **self.tf_params, eps=self.tf_eps, qk_norm=self.tf_qk_norm)
+        st["pos"] = st["pos"] + Fr
+        st["ctx"] = torch.clamp(st["ctx"] + Fr, max=self.front_mod.retained)
+        hidden, st["cnx0"], st["cnx1"], st["dec0"] = self.post(yT, st["cnx0"], st["cnx1"], st["dec0"])
+        return hidden
+
     @torch.no_grad()
     def __call__(self, codes):
         """codes [B, 16, F] (device) -> wav [B, 1, F*1920]; advances every row's stream state."""
         st = self.state
-        out = self.front(codes, st["pos"], st["ctx"], st["pre"], st["tf_k"], st["tf_v"], st["cnx0"], st["cnx1"], st["dec0"])
-        hidden = out[0]
-        st["pos"], st["ctx"], st["pre"], st["tf_k"], st["tf_v"], st["cnx0"], st["cnx1"], st["dec0"] = out[1:]
+        if self.nki_front:
+            hidden = self._front_nki(codes)
+        else:
+            out = self.front(codes, st["pos"], st["ctx"], st["pre"], st["tf_k"], st["tf_v"], st["cnx0"], st["cnx1"], st["dec0"])
+            hidden = out[0]
+            st["pos"], st["ctx"], st["pre"], st["tf_k"], st["tf_v"], st["cnx0"], st["cnx1"], st["dec0"] = out[1:]
         for i, ((tc, tc_static, _), units) in enumerate(self.blocks):
             hidden, st[f"tc{i}"] = snake_transconv(hidden, **tc, **tc_static, hist=st[f"tc{i}"])
             for j, (prm, static, _) in enumerate(units):
